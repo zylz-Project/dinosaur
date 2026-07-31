@@ -401,3 +401,9 @@ idf.py -p /dev/ttyUSB0 monitor
 4. **3 秒 smoothstep 渐变** — 动作间丝滑过渡，无突变
 5. **多频段自然晃动** — 舒缓模式下叠加多个非整数比频率的有机晃动，模拟呼吸/微动
 6. **防浮空 PWM 初始化** — 先拉低 GPIO 再配置 LEDC，避免上电瞬间舵机乱跳
+
+## Audio Hub 设备绑定
+
+联网模式下，`main/device_registry.cc` 会使用 ESP32 出厂 MAC 生成唯一设备 ID。首次启动时向 Audio Hub 注册，并在串口输出六位激活码；管理员在服务端后台绑定后，设备把正式令牌保存到 NVS，并每 60 秒上报一次心跳。
+
+启用前将 `main/config.h` 的 `OFFLINE_DEMO` 改为 `0`，正确填写 Wi-Fi、`SYNC_SERVER_IP` 和 `SYNC_SERVER_PORT`。完整协议见服务端仓库的 `docs/DEVICE_ONBOARDING.md`。

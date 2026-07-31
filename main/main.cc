@@ -1,6 +1,7 @@
 #include "config.h"
 #include "audio.h"
 #include "auto_run.h"
+#include "device_registry.h"
 #include "dino_samples.h"
 #include "flash_audio.h"
 #include "http_server.h"
@@ -39,6 +40,7 @@ extern "C" void app_main()
 
     // --- Sync audio files from server ---
     if (online) {
+        device_registry_start();
         WiFiPowerSave(false);           // disable PS during download
         sync_audio_files();
         WiFiPowerSave(true);            // re-enable PS for battery life
