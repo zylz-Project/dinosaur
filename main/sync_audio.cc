@@ -7,6 +7,7 @@
 #include "flash_audio.h"
 #include "config.h"
 
+#include <cJSON.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
@@ -46,7 +47,7 @@ static esp_err_t http_buf_handler(esp_http_client_event_t *evt)
     http_buf_t *buf = (http_buf_t *)evt->user_data;
     switch (evt->event_id) {
     case HTTP_EVENT_ON_DATA: {
-        size_t need = buf->len + evt->data_len;
+        size_t need = buf->len + evt->data_len + 1;
         if (need > buf->cap) {
             size_t new_cap = buf->cap * 2;
             if (new_cap < need) new_cap = need + 1024;
@@ -57,6 +58,8 @@ static esp_err_t http_buf_handler(esp_http_client_event_t *evt)
         }
         memcpy(buf->data + buf->len, evt->data, evt->data_len);
         buf->len = need;
+        buf->len--;
+        buf->data[buf->len] = '\0';
         break;
     }
     default:
@@ -71,6 +74,7 @@ static esp_err_t http_get_buf(const char *url, http_buf_t *out, int timeout_ms)
     if (!out->data) return ESP_ERR_NO_MEM;
     out->cap = 4096;
     out->len = 0;
+    out->data[0] = '\0';
 
     esp_http_client_config_t cfg = {};
     cfg.url = url;
@@ -182,45 +186,36 @@ struct server_file_t {
 static std::vector<server_file_t> parse_manifest(const char *json, size_t len)
 {
     std::vector<server_file_t> files;
-    const char *p = json;
-    const char *end = p + len;
-
-    while (p < end) {
-        const char *nkey = strstr(p, "\"name\":\"");
-        if (!nkey || nkey >= end) break;
-        nkey += 8;
-        const char *nend = strchr(nkey, '"');
-        if (!nend || nend >= end) break;
-
-        const char *skey = strstr(nend, "\"size\":");
-        if (!skey || skey >= end) break;
-        skey += 7;
-        uint32_t sz = (uint32_t)strtoul(skey, nullptr, 10);
-
-        // Parse optional "category":"xxx"
-        const char *ckey = strstr(nend, "\"category\":\"");
-        char cat[16] = {};
-        if (ckey && ckey < end) {
-            ckey += 12;
-            const char *cend = strchr(ckey, '"');
-            if (cend && cend < end) {
-                size_t cl = (size_t)(cend - ckey);
-                if (cl >= sizeof(cat)) cl = sizeof(cat) - 1;
-                memcpy(cat, ckey, cl);
-            }
-        }
-
-        server_file_t sf = {};
-        size_t nlen = (size_t)(nend - nkey);
-        if (nlen >= sizeof(sf.name)) nlen = sizeof(sf.name) - 1;
-        memcpy(sf.name, nkey, nlen);
-        sf.name[nlen] = '\0';
-        sf.size = sz;
-        strncpy(sf.category, cat[0] ? cat : "animal", sizeof(sf.category) - 1);
-
-        files.push_back(sf);
-        p = skey + 1;
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    cJSON *items = root ? cJSON_GetObjectItemCaseSensitive(root, "files") : nullptr;
+    if (!cJSON_IsArray(items)) {
+        ESP_LOGW(TAG, "Invalid manifest JSON");
+        cJSON_Delete(root);
+        return files;
     }
+
+    cJSON *item = nullptr;
+    cJSON_ArrayForEach(item, items) {
+        cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
+        cJSON *size = cJSON_GetObjectItemCaseSensitive(item, "size");
+        cJSON *category = cJSON_GetObjectItemCaseSensitive(item, "category");
+        if (!cJSON_IsString(name) || !cJSON_IsNumber(size)) continue;
+        size_t name_len = strlen(name->valuestring);
+        if (name_len == 0 || name_len >= sizeof(server_file_t::name)) {
+            ESP_LOGW(TAG, "Skip overlong audio filename (%u bytes)",
+                     (unsigned)name_len);
+            continue;
+        }
+        server_file_t sf = {};
+        strlcpy(sf.name, name->valuestring, sizeof(sf.name));
+        sf.size = (uint32_t)size->valuedouble;
+        const char *cat = cJSON_IsString(category) ? category->valuestring : "animal";
+        strlcpy(sf.category,
+                strcmp(cat, "ambient") == 0 ? "ambient" : "animal",
+                sizeof(sf.category));
+        files.push_back(sf);
+    }
+    cJSON_Delete(root);
     return files;
 }
 
