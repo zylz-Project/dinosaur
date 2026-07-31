@@ -316,13 +316,16 @@ static void strip_opus(char *name)
 /* format file size for display */
 static const char *fmt_size(uint32_t bytes)
 {
-    static char b[16];
+    // Ring buffers allow more than one fmt_size() call in the same log line.
+    static char buffers[4][16];
+    static unsigned next_buffer = 0;
+    char *b = buffers[next_buffer++ % 4];
     if (bytes >= 1024 * 1024)
-        snprintf(b, sizeof(b), "%.1f MB", bytes / (1024.0f * 1024.0f));
+        snprintf(b, 16, "%.1f MB", bytes / (1024.0f * 1024.0f));
     else if (bytes >= 1024)
-        snprintf(b, sizeof(b), "%lu KB", (unsigned long)(bytes / 1024));
+        snprintf(b, 16, "%lu KB", (unsigned long)(bytes / 1024));
     else
-        snprintf(b, sizeof(b), "%lu B", (unsigned long)bytes);
+        snprintf(b, 16, "%lu B", (unsigned long)bytes);
     return b;
 }
 
@@ -373,7 +376,10 @@ esp_err_t sync_audio_files(void)
     int deleted = 0;
     for (int i = local_count - 1; i >= 0; i--) {
         flash_audio_info_t info;
-        flash_audio_get_file_info(i, &info);
+        if (flash_audio_get_file_info(i, &info) != ESP_OK) {
+            ESP_LOGE(TAG, "Cannot read Flash TOC entry %d; abort sync", i);
+            return ESP_FAIL;
+        }
         bool found = false;
         for (auto &sf : server_files) {
             char sn[FLASH_AUDIO_FILENAME_MAX];
@@ -381,7 +387,15 @@ esp_err_t sync_audio_files(void)
             strip_opus(sn);
             if (strcmp(info.name, sn) == 0) { found = true; break; }
         }
-        if (!found) { flash_audio_delete_file(info.name); deleted++; }
+        if (!found) {
+            ESP_LOGI(TAG, "  DELETE  %-30s  %s", info.name, fmt_size(info.size));
+            if (flash_audio_delete_file(info.name) != ESP_OK) {
+                ESP_LOGE(TAG, "Cannot delete obsolete file '%s'; abort sync",
+                         info.name);
+                return ESP_FAIL;
+            }
+            deleted++;
+        }
     }
 
     // 3. Print comparison result for each file
@@ -395,7 +409,11 @@ esp_err_t sync_audio_files(void)
         int local_idx = flash_audio_find_file(dn);
         if (local_idx >= 0) {
             flash_audio_info_t info;
-            flash_audio_get_file_info(local_idx, &info);
+            if (flash_audio_get_file_info(local_idx, &info) != ESP_OK) {
+                ESP_LOGE(TAG, "Cannot read Flash TOC entry %d; abort sync",
+                         local_idx);
+                return ESP_FAIL;
+            }
             if (!force_refresh && info.size == server_files[idx].size) {
                 to_skip++;
                 continue;
@@ -411,22 +429,6 @@ esp_err_t sync_audio_files(void)
                      dn, fmt_size(server_files[idx].size));
         }
         to_dl++;
-    }
-    // Show deleted files
-    for (int i = 0; i < local_count; i++) {
-        flash_audio_info_t info;
-        flash_audio_get_file_info(i, &info);
-        bool on_server = false;
-        for (auto &sf : server_files) {
-            char sn[FLASH_AUDIO_FILENAME_MAX];
-            strncpy(sn, sf.name, sizeof(sn) - 1); sn[sizeof(sn) - 1] = '\0';
-            strip_opus(sn);
-            if (strcmp(info.name, sn) == 0) { on_server = true; break; }
-        }
-        if (!on_server) {
-            ESP_LOGI(TAG, "  DELETE  %-30s  %s",
-                     info.name, fmt_size(info.size));
-        }
     }
     ESP_LOGI(TAG, "--- Result: +%d -%d =%d ---", to_dl, deleted, to_skip);
     if (to_dl == 0 && deleted == 0) {
@@ -450,7 +452,12 @@ esp_err_t sync_audio_files(void)
         int local_idx = flash_audio_find_file(dn);
         if (local_idx >= 0) {
             flash_audio_info_t info;
-            flash_audio_get_file_info(local_idx, &info);
+            if (flash_audio_get_file_info(local_idx, &info) != ESP_OK) {
+                ESP_LOGE(TAG, "[%d/%d] FAIL  %s (cannot read Flash TOC)",
+                         idx + 1, total, dn);
+                failed++;
+                continue;
+            }
             if (!force_refresh && info.size == sf.size) {
                 skipped++;
                 continue;
@@ -458,44 +465,48 @@ esp_err_t sync_audio_files(void)
             // Equal-size refreshes can safely overwrite in place. A size change
             // must append elsewhere so it cannot overlap the following file.
             if (info.size != sf.size) {
-                flash_audio_delete_file(dn);
+                if (flash_audio_delete_file(dn) != ESP_OK) {
+                    ESP_LOGE(TAG, "[%d/%d] FAIL  %s (cannot delete old file)",
+                             idx + 1, total, dn);
+                    failed++;
+                    continue;
+                }
             }
         }
 
         // Stream download → flash
-        flash_audio_stream_t stream;
-        ret = flash_audio_stream_begin(&stream, sf.name, sf.size, 48000, sf.category);
-        if (ret != ESP_OK) { failed++; continue; }
-
-        // Download with retry (up to 3 attempts)
         uint32_t expect_size = sf.size;
-        ret = download_stream(idx, total, dn, sf.size, &stream);
-        int attempt = 1;
-        while ((ret != ESP_OK || stream.written < expect_size) && attempt < 3) {
-            uint32_t got = stream.written;
-            flash_audio_stream_end(&stream);
-            int delay_ms = 2000 * attempt;  // 2s, 4s, 6s
-            ESP_LOGW(TAG, "[%d/%d] retry %d/3 %s (got %lu/%lu, delay %ds)",
-                     idx + 1, total, attempt, dn,
-                     (unsigned long)got, (unsigned long)expect_size, delay_ms/1000);
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-            flash_audio_stream_begin(&stream, sf.name, sf.size, 48000, sf.category);
-            ret = download_stream(idx, total, dn, sf.size, &stream);
-            attempt++;
+        uint32_t last_written = 0;
+        bool download_ok = false;
+        int attempt = 0;
+        for (attempt = 1; attempt <= 3; attempt++) {
+            flash_audio_stream_t stream;
+            ret = flash_audio_stream_begin(
+                &stream, sf.name, sf.size, 48000, sf.category);
+            if (ret == ESP_OK) {
+                ret = download_stream(idx, total, dn, sf.size, &stream);
+                last_written = stream.written;
+                if (ret == ESP_OK && stream.written == expect_size &&
+                    flash_audio_stream_end(&stream) == ESP_OK) {
+                    download_ok = true;
+                    break;
+                }
+                if (stream.active) flash_audio_stream_end(&stream);
+            }
+            if (attempt < 3) {
+                int delay_ms = 2000 * attempt;
+                ESP_LOGW(TAG,
+                         "[%d/%d] retry %d/3 %s (got %lu/%lu, delay %ds)",
+                         idx + 1, total, attempt, dn,
+                         (unsigned long)last_written,
+                         (unsigned long)expect_size, delay_ms / 1000);
+                vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            }
         }
-        if (ret != ESP_OK || stream.written < expect_size) {
+        if (!download_ok) {
             ESP_LOGW(TAG, "[%d/%d] FAIL  %s (%lu/%lu bytes after %d tries)",
-                     idx + 1, total, dn,
-                     (unsigned long)stream.written, (unsigned long)expect_size, attempt);
-            flash_audio_stream_end(&stream);
-            failed++;
-            continue;
-        }
-
-        ret = flash_audio_stream_end(&stream);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "[%d/%d] FAIL  %s (cannot finalize flash entry)",
-                     idx + 1, total, dn);
+                     idx + 1, total, dn, (unsigned long)last_written,
+                     (unsigned long)expect_size, attempt - 1);
             failed++;
             continue;
         }
