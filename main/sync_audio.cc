@@ -12,6 +12,7 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <nvs.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,9 @@
 #include <vector>
 
 static const char *TAG = "sync";
+static const char *SYNC_NVS_NAMESPACE = "audio_sync";
+static const char *SYNC_NVS_REVISION_KEY = "revision";
+static constexpr size_t SYNC_REVISION_MAX = 64;
 
 /* --------------------------------------------------------------------------
    Server endpoint helpers
@@ -183,40 +187,118 @@ struct server_file_t {
     char     category[16];  // "animal" or "ambient"
 };
 
-static std::vector<server_file_t> parse_manifest(const char *json, size_t len)
+static bool parse_manifest(const char *json, size_t len,
+                           std::vector<server_file_t> *files,
+                           char *revision, size_t revision_size)
 {
-    std::vector<server_file_t> files;
+    if (!json || !files || !revision || revision_size == 0) return false;
+    files->clear();
+    revision[0] = '\0';
+
     cJSON *root = cJSON_ParseWithLength(json, len);
     cJSON *items = root ? cJSON_GetObjectItemCaseSensitive(root, "files") : nullptr;
-    if (!cJSON_IsArray(items)) {
+    cJSON *revision_item = root
+        ? cJSON_GetObjectItemCaseSensitive(root, "revision")
+        : nullptr;
+    if (!cJSON_IsObject(root) || !cJSON_IsArray(items) ||
+        !cJSON_IsString(revision_item) || !revision_item->valuestring ||
+        strlen(revision_item->valuestring) == 0 ||
+        strlen(revision_item->valuestring) >= revision_size) {
         ESP_LOGW(TAG, "Invalid manifest JSON");
         cJSON_Delete(root);
-        return files;
+        return false;
     }
+    strlcpy(revision, revision_item->valuestring, revision_size);
 
     cJSON *item = nullptr;
     cJSON_ArrayForEach(item, items) {
         cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
         cJSON *size = cJSON_GetObjectItemCaseSensitive(item, "size");
         cJSON *category = cJSON_GetObjectItemCaseSensitive(item, "category");
-        if (!cJSON_IsString(name) || !cJSON_IsNumber(size)) continue;
+        if (!cJSON_IsObject(item) || !cJSON_IsString(name) ||
+            !name->valuestring || !cJSON_IsNumber(size) ||
+            size->valuedouble <= 0 || size->valuedouble > UINT32_MAX ||
+            !cJSON_IsString(category) || !category->valuestring ||
+            (strcmp(category->valuestring, "animal") != 0 &&
+             strcmp(category->valuestring, "ambient") != 0)) {
+            ESP_LOGW(TAG, "Manifest contains an invalid file entry");
+            cJSON_Delete(root);
+            files->clear();
+            revision[0] = '\0';
+            return false;
+        }
         size_t name_len = strlen(name->valuestring);
         if (name_len == 0 || name_len >= sizeof(server_file_t::name)) {
-            ESP_LOGW(TAG, "Skip overlong audio filename (%u bytes)",
+            ESP_LOGW(TAG, "Manifest contains an overlong filename (%u bytes)",
                      (unsigned)name_len);
-            continue;
+            cJSON_Delete(root);
+            files->clear();
+            revision[0] = '\0';
+            return false;
+        }
+        if (name_len <= 5 ||
+            strcmp(name->valuestring + name_len - 5, ".opus") != 0) {
+            ESP_LOGW(TAG, "Manifest contains a non-Opus filename");
+            cJSON_Delete(root);
+            files->clear();
+            revision[0] = '\0';
+            return false;
         }
         server_file_t sf = {};
         strlcpy(sf.name, name->valuestring, sizeof(sf.name));
         sf.size = (uint32_t)size->valuedouble;
-        const char *cat = cJSON_IsString(category) ? category->valuestring : "animal";
-        strlcpy(sf.category,
-                strcmp(cat, "ambient") == 0 ? "ambient" : "animal",
-                sizeof(sf.category));
-        files.push_back(sf);
+        strlcpy(sf.category, category->valuestring, sizeof(sf.category));
+        for (const auto &existing : *files) {
+            if (strcmp(existing.name, sf.name) == 0) {
+                ESP_LOGW(TAG, "Manifest contains duplicate filename: %s", sf.name);
+                cJSON_Delete(root);
+                files->clear();
+                revision[0] = '\0';
+                return false;
+            }
+        }
+        files->push_back(sf);
     }
     cJSON_Delete(root);
-    return files;
+    return true;
+}
+
+static bool load_synced_revision(char *revision, size_t revision_size)
+{
+    if (!revision || revision_size == 0) return false;
+    revision[0] = '\0';
+
+    nvs_handle_t handle;
+    if (nvs_open(SYNC_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return false;
+    }
+    size_t required = revision_size;
+    esp_err_t ret = nvs_get_str(handle, SYNC_NVS_REVISION_KEY, revision, &required);
+    nvs_close(handle);
+    if (ret != ESP_OK) {
+        revision[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static bool save_synced_revision(const char *revision)
+{
+    if (!revision || revision[0] == '\0') return false;
+
+    nvs_handle_t handle;
+    if (nvs_open(SYNC_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGW(TAG, "Cannot open NVS to save manifest revision");
+        return false;
+    }
+    esp_err_t ret = nvs_set_str(handle, SYNC_NVS_REVISION_KEY, revision);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Cannot save manifest revision: %s", esp_err_to_name(ret));
+        return false;
+    }
+    return true;
 }
 
 /* ==========================================================================
@@ -265,8 +347,24 @@ esp_err_t sync_audio_files(void)
         return ESP_FAIL;
     }
 
-    auto server_files = parse_manifest((const char *)buf.data, buf.len);
+    std::vector<server_file_t> server_files;
+    char server_revision[SYNC_REVISION_MAX] = {};
+    bool manifest_ok = parse_manifest((const char *)buf.data, buf.len,
+                                      &server_files, server_revision,
+                                      sizeof(server_revision));
     free(buf.data);
+    if (!manifest_ok) {
+        ESP_LOGW(TAG, "Reject invalid manifest; flash contents left unchanged");
+        return ESP_FAIL;
+    }
+
+    char synced_revision[SYNC_REVISION_MAX] = {};
+    load_synced_revision(synced_revision, sizeof(synced_revision));
+    bool force_refresh = strcmp(server_revision, synced_revision) != 0;
+    if (force_refresh) {
+        ESP_LOGI(TAG, "Manifest revision changed: %s -> %s; verify all files",
+                 synced_revision[0] ? synced_revision : "(none)", server_revision);
+    }
 
     int local_count = flash_audio_get_file_count();
     ESP_LOGI(TAG, "Server[%zu] <-> Flash[%d]", server_files.size(), local_count);
@@ -298,12 +396,16 @@ esp_err_t sync_audio_files(void)
         if (local_idx >= 0) {
             flash_audio_info_t info;
             flash_audio_get_file_info(local_idx, &info);
-            if (info.size == server_files[idx].size) {
+            if (!force_refresh && info.size == server_files[idx].size) {
                 to_skip++;
                 continue;
             }
-            ESP_LOGI(TAG, "  UPDATE  %-30s  %s -> %s",
-                     dn, fmt_size(info.size), fmt_size(server_files[idx].size));
+            if (info.size == server_files[idx].size) {
+                ESP_LOGI(TAG, "  REFRESH %-30s  %s", dn, fmt_size(info.size));
+            } else {
+                ESP_LOGI(TAG, "  UPDATE  %-30s  %s -> %s",
+                         dn, fmt_size(info.size), fmt_size(server_files[idx].size));
+            }
         } else {
             ESP_LOGI(TAG, "  NEW     %-30s  %s",
                      dn, fmt_size(server_files[idx].size));
@@ -329,7 +431,8 @@ esp_err_t sync_audio_files(void)
     ESP_LOGI(TAG, "--- Result: +%d -%d =%d ---", to_dl, deleted, to_skip);
     if (to_dl == 0 && deleted == 0) {
         ESP_LOGI(TAG, "All up to date, nothing to do");
-        return ESP_OK;
+        return (!force_refresh || save_synced_revision(server_revision))
+            ? ESP_OK : ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "Download base URL: %s/api/download-idx/<n>?product=%s", g_base_url, SYNC_PRODUCT_ID);
@@ -348,11 +451,15 @@ esp_err_t sync_audio_files(void)
         if (local_idx >= 0) {
             flash_audio_info_t info;
             flash_audio_get_file_info(local_idx, &info);
-            if (info.size == sf.size) {
+            if (!force_refresh && info.size == sf.size) {
                 skipped++;
                 continue;
             }
-            flash_audio_delete_file(dn);
+            // Equal-size refreshes can safely overwrite in place. A size change
+            // must append elsewhere so it cannot overlap the following file.
+            if (info.size != sf.size) {
+                flash_audio_delete_file(dn);
+            }
         }
 
         // Stream download → flash
@@ -385,7 +492,13 @@ esp_err_t sync_audio_files(void)
             continue;
         }
 
-        flash_audio_stream_end(&stream);
+        ret = flash_audio_stream_end(&stream);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "[%d/%d] FAIL  %s (cannot finalize flash entry)",
+                     idx + 1, total, dn);
+            failed++;
+            continue;
+        }
         downloaded++;
         ESP_LOGI(TAG, "[%d/%d] OK    %-30s %s",
                  idx + 1, total, dn, fmt_size(sf.size));
@@ -393,5 +506,9 @@ esp_err_t sync_audio_files(void)
 
     ESP_LOGI(TAG, "--- Sync end: download=%d delete=%d skip=%d fail=%d ---",
              downloaded, deleted, skipped, failed);
+    if (failed == 0 && force_refresh &&
+        !save_synced_revision(server_revision)) {
+        return ESP_FAIL;
+    }
     return (failed == 0) ? ESP_OK : ESP_FAIL;
 }
