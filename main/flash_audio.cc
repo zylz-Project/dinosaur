@@ -1,6 +1,7 @@
 #include "flash_audio.h"
-#include "w25q256.h"
+#include "external_flash.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
@@ -91,20 +92,20 @@ static bool toc_deserialize(const uint8_t *buf, size_t buf_sz)
 /* Flush TOC to SPI Flash */
 static esp_err_t toc_flush(void)
 {
-    uint8_t buf[W25Q256_SECTOR_SIZE];
+    uint8_t buf[EXTERNAL_FLASH_TOC_SIZE];
     memset(buf, 0xFF, sizeof(buf));
     size_t toc_len = toc_serialize(buf, sizeof(buf));
     if (toc_len == 0)
         return ESP_FAIL;
 
     // Erase TOC sector and write
-    uint32_t toc_addr = FLASH_AUDIO_TOC_SECTOR * W25Q256_SECTOR_SIZE;
-    esp_err_t ret = w25q256_erase_sector(toc_addr);
+    uint32_t toc_addr = FLASH_AUDIO_TOC_SECTOR * EXTERNAL_FLASH_ERASE_SIZE;
+    esp_err_t ret = external_flash_erase_unit(toc_addr);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to erase TOC sector");
         return ret;
     }
-    ret = w25q256_write(toc_addr, buf, toc_len);
+    ret = external_flash_write(toc_addr, buf, toc_len);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write TOC");
         return ret;
@@ -123,18 +124,19 @@ esp_err_t flash_audio_init(void)
         return ESP_OK;
 
     // Initialize SPI Flash hardware
-    esp_err_t ret = w25q256_init();
+    esp_err_t ret = external_flash_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SPI Flash init failed — audio from flash disabled");
         g_file_count = 0;
         g_initialized = true;  // Mark as initialized but empty
         return ret;
     }
+    ESP_LOGI(TAG, "External flash selected: %s", EXTERNAL_FLASH_NAME);
 
     // Read TOC from flash
-    uint8_t toc_buf[W25Q256_SECTOR_SIZE];
-    uint32_t toc_addr = FLASH_AUDIO_TOC_SECTOR * W25Q256_SECTOR_SIZE;
-    ret = w25q256_read(toc_addr, toc_buf, sizeof(toc_buf));
+    uint8_t toc_buf[EXTERNAL_FLASH_TOC_SIZE];
+    uint32_t toc_addr = FLASH_AUDIO_TOC_SECTOR * EXTERNAL_FLASH_ERASE_SIZE;
+    ret = external_flash_read(toc_addr, toc_buf, sizeof(toc_buf));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read TOC sector");
         g_file_count = 0;
@@ -148,7 +150,7 @@ esp_err_t flash_audio_init(void)
     }
 
     g_initialized = true;
-    uint64_t cap = w25q256_get_capacity();
+    uint64_t cap = external_flash_get_capacity();
     uint32_t used = 0;
     int animal_cnt = 0, ambient_cnt = 0;
     for (int i = 0; i < g_file_count; i++) {
@@ -218,7 +220,7 @@ esp_err_t flash_audio_read_file(int index, uint32_t offset, uint8_t *buf, size_t
         return ESP_ERR_INVALID_ARG;
 
     uint32_t flash_addr = FLASH_AUDIO_DATA_START + g_files[index].offset + offset;
-    return w25q256_read(flash_addr, buf, len);
+    return external_flash_read(flash_addr, buf, len);
 }
 
 esp_err_t flash_audio_write_file(const char *filename, const uint8_t *data,
@@ -244,18 +246,18 @@ esp_err_t flash_audio_write_file(const char *filename, const uint8_t *data,
             auto &last = g_files[g_file_count - 1];
             offset = last.offset + last.size;
             // Align to sector boundary
-            if (offset % W25Q256_SECTOR_SIZE != 0) {
-                offset = ((offset / W25Q256_SECTOR_SIZE) + 1) * W25Q256_SECTOR_SIZE;
+            if (offset % EXTERNAL_FLASH_ERASE_SIZE != 0) {
+                offset = ((offset / EXTERNAL_FLASH_ERASE_SIZE) + 1) * EXTERNAL_FLASH_ERASE_SIZE;
             }
         }
         // else first file, offset = 0
     }
 
     // Erase sectors needed (with yield to keep WiFi alive)
-    uint32_t start_sector = (FLASH_AUDIO_DATA_START + offset) / W25Q256_SECTOR_SIZE;
-    uint32_t end_sector = (FLASH_AUDIO_DATA_START + offset + len + W25Q256_SECTOR_SIZE - 1) / W25Q256_SECTOR_SIZE;
+    uint32_t start_sector = (FLASH_AUDIO_DATA_START + offset) / EXTERNAL_FLASH_ERASE_SIZE;
+    uint32_t end_sector = (FLASH_AUDIO_DATA_START + offset + len + EXTERNAL_FLASH_ERASE_SIZE - 1) / EXTERNAL_FLASH_ERASE_SIZE;
     for (uint32_t sec = start_sector; sec < end_sector; sec++) {
-        esp_err_t ret = w25q256_erase_sector(sec * W25Q256_SECTOR_SIZE);
+        esp_err_t ret = external_flash_erase_unit(sec * EXTERNAL_FLASH_ERASE_SIZE);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to erase sector %lu", (unsigned long)sec);
             return ret;
@@ -265,7 +267,7 @@ esp_err_t flash_audio_write_file(const char *filename, const uint8_t *data,
 
     // Write data
     uint32_t flash_addr = FLASH_AUDIO_DATA_START + offset;
-    esp_err_t ret = w25q256_write(flash_addr, data, len);
+    esp_err_t ret = external_flash_write(flash_addr, data, len);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write file data");
         return ret;
@@ -326,15 +328,15 @@ esp_err_t flash_audio_stream_begin(flash_audio_stream_t *s, const char *filename
         if (g_file_count > 0) {
             auto &last = g_files[g_file_count - 1];
             s->data_offset = last.offset + last.size;
-            if (s->data_offset % W25Q256_SECTOR_SIZE != 0)
-                s->data_offset = ((s->data_offset / W25Q256_SECTOR_SIZE) + 1) * W25Q256_SECTOR_SIZE;
+            if (s->data_offset % EXTERNAL_FLASH_ERASE_SIZE != 0)
+                s->data_offset = ((s->data_offset / EXTERNAL_FLASH_ERASE_SIZE) + 1) * EXTERNAL_FLASH_ERASE_SIZE;
         }
     }
 
     s->flash_addr = FLASH_AUDIO_DATA_START + s->data_offset;
 
-    uint32_t start_sec = s->flash_addr / W25Q256_SECTOR_SIZE;
-    uint32_t end_sec = (s->flash_addr + total_size + W25Q256_SECTOR_SIZE - 1) / W25Q256_SECTOR_SIZE;
+    uint32_t start_sec = s->flash_addr / EXTERNAL_FLASH_ERASE_SIZE;
+    uint32_t end_sec = (s->flash_addr + total_size + EXTERNAL_FLASH_ERASE_SIZE - 1) / EXTERNAL_FLASH_ERASE_SIZE;
     uint32_t sec_count = end_sec - start_sec;
     ESP_LOGI(TAG, "Stream begin: %s (%lu KB, %lu sectors @ 0x%06lX)",
              s->name, (unsigned long)(total_size/1024),
@@ -346,7 +348,7 @@ esp_err_t flash_audio_stream_begin(flash_audio_stream_t *s, const char *filename
     if (erase_log_every < 1) erase_log_every = 1;
 
     for (uint32_t sec = start_sec; sec < end_sec; sec++) {
-        esp_err_t ret = w25q256_erase_sector(sec * W25Q256_SECTOR_SIZE);
+        esp_err_t ret = external_flash_erase_unit(sec * EXTERNAL_FLASH_ERASE_SIZE);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Erase failed @ sector %lu", (unsigned long)sec);
             return ret;
@@ -361,19 +363,44 @@ esp_err_t flash_audio_stream_begin(flash_audio_stream_t *s, const char *filename
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
+    s->pending_buf = (uint8_t *)malloc(EXTERNAL_FLASH_PROGRAM_SIZE);
+    if (!s->pending_buf) return ESP_ERR_NO_MEM;
+    memset(s->pending_buf, 0xFF, EXTERNAL_FLASH_PROGRAM_SIZE);
     s->active = true;
     return ESP_OK;
 }
 
 esp_err_t flash_audio_stream_write(flash_audio_stream_t *s, const uint8_t *data, size_t len)
 {
-    if (!s || !s->active) return ESP_ERR_INVALID_STATE;
-    if (s->written + len > s->total_size) return ESP_ERR_INVALID_ARG;
+    if (!s || !s->active || s->failed) return ESP_ERR_INVALID_STATE;
+    if ((!data && len) || s->written + len > s->total_size) {
+        s->failed = true;
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    esp_err_t ret = w25q256_write(s->flash_addr + s->written, data, len);
-    if (ret != ESP_OK) return ret;
+    size_t consumed = 0;
+    while (consumed < len) {
+        size_t space = EXTERNAL_FLASH_PROGRAM_SIZE - s->pending_len;
+        size_t take = len - consumed;
+        if (take > space) take = space;
+        memcpy(s->pending_buf + s->pending_len, data + consumed, take);
+        s->pending_len += take;
+        s->written += take;
+        consumed += take;
 
-    s->written += len;
+        if (s->pending_len == EXTERNAL_FLASH_PROGRAM_SIZE) {
+            esp_err_t ret = external_flash_write(s->flash_addr + s->programmed,
+                                                 s->pending_buf,
+                                                 EXTERNAL_FLASH_PROGRAM_SIZE);
+            if (ret != ESP_OK) {
+                s->failed = true;
+                return ret;
+            }
+            s->programmed += EXTERNAL_FLASH_PROGRAM_SIZE;
+            s->pending_len = 0;
+            memset(s->pending_buf, 0xFF, EXTERNAL_FLASH_PROGRAM_SIZE);
+        }
+    }
     return ESP_OK;
 }
 
@@ -382,11 +409,28 @@ esp_err_t flash_audio_stream_end(flash_audio_stream_t *s)
     if (!s || !s->active) return ESP_ERR_INVALID_STATE;
     s->active = false;
 
-    if (s->written < s->total_size) {
+    if (s->failed || s->written != s->total_size) {
         ESP_LOGW(TAG, "Stream incomplete: %s (%lu/%lu bytes)",
                  s->name, (unsigned long)s->written, (unsigned long)s->total_size);
+        free(s->pending_buf);
+        s->pending_buf = nullptr;
         return ESP_FAIL;
     }
+
+    if (s->pending_len > 0) {
+        esp_err_t ret = external_flash_write(s->flash_addr + s->programmed,
+                                             s->pending_buf,
+                                             EXTERNAL_FLASH_PROGRAM_SIZE);
+        if (ret != ESP_OK) {
+            free(s->pending_buf);
+            s->pending_buf = nullptr;
+            return ret;
+        }
+        s->programmed += EXTERNAL_FLASH_PROGRAM_SIZE;
+        s->pending_len = 0;
+    }
+    free(s->pending_buf);
+    s->pending_buf = nullptr;
 
     // Update TOC entry
     int idx = s->existing_idx;
@@ -426,10 +470,10 @@ esp_err_t flash_audio_delete_file(const char *filename)
              (unsigned long)data_size / 1024);
 
     // Erase data sectors
-    uint32_t start_sec = data_addr / W25Q256_SECTOR_SIZE;
-    uint32_t end_sec = (data_addr + data_size + W25Q256_SECTOR_SIZE - 1) / W25Q256_SECTOR_SIZE;
+    uint32_t start_sec = data_addr / EXTERNAL_FLASH_ERASE_SIZE;
+    uint32_t end_sec = (data_addr + data_size + EXTERNAL_FLASH_ERASE_SIZE - 1) / EXTERNAL_FLASH_ERASE_SIZE;
     for (uint32_t sec = start_sec; sec < end_sec; sec++) {
-        w25q256_erase_sector(sec * W25Q256_SECTOR_SIZE);
+        external_flash_erase_unit(sec * EXTERNAL_FLASH_ERASE_SIZE);
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 
@@ -451,12 +495,12 @@ esp_err_t flash_audio_erase_all(void)
     for (int i = 0; i < g_file_count; i++) {
         uint32_t start = FLASH_AUDIO_DATA_START + g_files[i].offset;
         uint32_t end = start + g_files[i].size;
-        total_sec += (end + W25Q256_SECTOR_SIZE - 1) / W25Q256_SECTOR_SIZE
-                     - start / W25Q256_SECTOR_SIZE;
+        total_sec += (end + EXTERNAL_FLASH_ERASE_SIZE - 1) / EXTERNAL_FLASH_ERASE_SIZE
+                     - start / EXTERNAL_FLASH_ERASE_SIZE;
     }
 
     // Erase TOC sector
-    w25q256_erase_sector(FLASH_AUDIO_TOC_SECTOR * W25Q256_SECTOR_SIZE);
+    external_flash_erase_unit(FLASH_AUDIO_TOC_SECTOR * EXTERNAL_FLASH_ERASE_SIZE);
     uint32_t done = 1;
     int last_pct = 0;
 
@@ -464,10 +508,10 @@ esp_err_t flash_audio_erase_all(void)
     for (int i = 0; i < g_file_count; i++) {
         uint32_t start = FLASH_AUDIO_DATA_START + g_files[i].offset;
         uint32_t end = start + g_files[i].size;
-        uint32_t sec_start = start / W25Q256_SECTOR_SIZE;
-        uint32_t sec_end = (end + W25Q256_SECTOR_SIZE - 1) / W25Q256_SECTOR_SIZE;
+        uint32_t sec_start = start / EXTERNAL_FLASH_ERASE_SIZE;
+        uint32_t sec_end = (end + EXTERNAL_FLASH_ERASE_SIZE - 1) / EXTERNAL_FLASH_ERASE_SIZE;
         for (uint32_t sec = sec_start; sec < sec_end; sec++) {
-            w25q256_erase_sector(sec * W25Q256_SECTOR_SIZE);
+            external_flash_erase_unit(sec * EXTERNAL_FLASH_ERASE_SIZE);
             done++;
             int pct = (int)(done * 100 / total_sec);
             if (pct - last_pct >= 10) {
@@ -487,18 +531,18 @@ esp_err_t flash_audio_erase_all(void)
 
 esp_err_t flash_audio_write_toc(const uint8_t *toc_data, size_t toc_len)
 {
-    if (!toc_data || toc_len == 0 || toc_len > W25Q256_SECTOR_SIZE)
+    if (!toc_data || toc_len == 0 || toc_len > EXTERNAL_FLASH_TOC_SIZE)
         return ESP_ERR_INVALID_ARG;
 
-    uint8_t buf[W25Q256_SECTOR_SIZE];
+    uint8_t buf[EXTERNAL_FLASH_TOC_SIZE];
     memset(buf, 0xFF, sizeof(buf));
     memcpy(buf, toc_data, toc_len);
 
-    uint32_t toc_addr = FLASH_AUDIO_TOC_SECTOR * W25Q256_SECTOR_SIZE;
-    esp_err_t ret = w25q256_erase_sector(toc_addr);
+    uint32_t toc_addr = FLASH_AUDIO_TOC_SECTOR * EXTERNAL_FLASH_ERASE_SIZE;
+    esp_err_t ret = external_flash_erase_unit(toc_addr);
     if (ret != ESP_OK)
         return ret;
-    ret = w25q256_write(toc_addr, buf, toc_len);
+    ret = external_flash_write(toc_addr, buf, toc_len);
     if (ret != ESP_OK)
         return ret;
 
@@ -510,11 +554,11 @@ esp_err_t flash_audio_write_toc(const uint8_t *toc_data, size_t toc_len)
 
 esp_err_t flash_audio_read_toc(uint8_t *buf, size_t buf_sz)
 {
-    if (!buf || buf_sz < W25Q256_SECTOR_SIZE)
+    if (!buf || buf_sz < EXTERNAL_FLASH_TOC_SIZE)
         return ESP_ERR_INVALID_ARG;
 
-    uint32_t toc_addr = FLASH_AUDIO_TOC_SECTOR * W25Q256_SECTOR_SIZE;
-    return w25q256_read(toc_addr, buf, buf_sz);
+    uint32_t toc_addr = FLASH_AUDIO_TOC_SECTOR * EXTERNAL_FLASH_ERASE_SIZE;
+    return external_flash_read(toc_addr, buf, EXTERNAL_FLASH_TOC_SIZE);
 }
 
 int flash_audio_get_count_by_category(const char *category)

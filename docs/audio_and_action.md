@@ -408,11 +408,11 @@ duty = pulse_us × 8192 / 20000
 
 ```cpp
 enum ServoIndex {
-    SERVO_NECK_TILT = 0,  // IO15 — 脖子前后倾
+    SERVO_NECK_TILT = 0,  // IO17 — 脖子上下
     SERVO_NECK_LEAN = 1,  // IO16 — 脖子左右倾
-    SERVO_HEAD_TURN = 2,  // IO17 — 头左右转
-    SERVO_TAIL_UD   = 3,  // IO18 — 尾巴上下
-    SERVO_TAIL_LR   = 4,  // IO8  — 尾巴左右
+    SERVO_HEAD_TURN = 2,  // IO15 — 头左右转
+    SERVO_TAIL_UD   = 3,  // IO8  — 尾巴上下
+    SERVO_TAIL_LR   = 4,  // IO18 — 尾巴左右
 };
 
 void SetServoAngle(int idx, int angle);  // angle ∈ [0, 180]
@@ -479,7 +479,7 @@ float drift_ud = 2.5f × sin(t × 0.09 + 2.1);  // ~70s 周期, 幅度 ±2.5°
 
 ```
 恐龙动作模型
-├── 脖子 (Neck)    — 2 轴: Tilt(IO15) + Lean(IO16)
+├── 脖子 (Neck)    — 2 轴: UD(IO17) + Lean(IO16)
 │   ├── NECK_BREATHE      呼吸 (温和振荡)
 │   ├── NECK_IDLE         待机 (微小动作)
 │   ├── NECK_NOD          点头 (大幅度前后)
@@ -491,14 +491,14 @@ float drift_ud = 2.5f × sin(t × 0.09 + 2.1);  // ~70s 周期, 幅度 ±2.5°
 │   ├── NECK_PECK         啄食 (快速前后)
 │   └── NECK_CURIOUS      好奇 (交替方向)
 │
-├── 头部 (Head)    — 1 轴: Turn(IO17)
+├── 头部 (Head)    — 1 轴: Turn(IO15)
 │   ├── HEAD_CENTER       正中 (几乎不动)
 │   ├── HEAD_LOOK_LEFT    向左看
 │   ├── HEAD_LOOK_RIGHT   向右看
 │   ├── HEAD_SCAN         全景扫描
 │   └── HEAD_TILT_CURIOUS 好奇歪头
 │
-└── 尾巴 (Tail)    — 2 轴: UD(IO18) + LR(IO8)
+└── 尾巴 (Tail)    — 2 轴: UD(IO8) + LR(IO18)
     ├── TAIL_RELAX        放松 (温和摇摆)
     ├── TAIL_WAG          摇尾 (快速左右)
     ├── TAIL_RAISE        竖起
@@ -754,16 +754,16 @@ static void sound_to_action(int sound, NeckMode &nm, HeadMode &hm, TailMode &tm,
 │           Dino Pet Controller                 │
 │                                              │
 │  ┌──────────────────────────────────────┐    │
-│  │ Neck 脖子 (IO15: 前后  IO16: 左右)    │    │
+│  │ Neck 脖子 (IO17: 上下  IO16: 左右)    │    │
 │  │ Tilt [═══════●═══════] 90°           │    │
 │  │ Lean [═══════●═══════] 90°           │    │
 │  └──────────────────────────────────────┘    │
 │  ┌──────────────────────────────────────┐    │
-│  │ Head 头部 (IO17: 转头)               │    │
+│  │ Head 头部 (IO15: 转头)               │    │
 │  │ Turn [═══════●═══════] 90°           │    │
 │  └──────────────────────────────────────┘    │
 │  ┌──────────────────────────────────────┐    │
-│  │ Tail 尾巴 (IO18: 上下  IO8: 左右)    │    │
+│  │ Tail 尾巴 (IO8: 上下  IO18: 左右)    │    │
 │  │ UD   [═══════●═══════] 90°           │    │
 │  │ LR   [═══════●═══════] 90°           │    │
 │  └──────────────────────────────────────┘    │

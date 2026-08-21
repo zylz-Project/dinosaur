@@ -164,33 +164,64 @@ static esp_err_t HandleFlashPage(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static void EscapeJsonString(const char *src, char *dst, size_t dst_size) {
+    if (!dst_size) return;
+    size_t out = 0;
+    while (src && *src && out + 1 < dst_size) {
+        const unsigned char ch = (unsigned char)*src++;
+        if ((ch == '"' || ch == '\\') && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = (char)ch;
+        } else if (ch >= 0x20) {
+            dst[out++] = (char)ch;
+        }
+    }
+    dst[out] = '\0';
+}
+
 static esp_err_t HandleFlashStatus(httpd_req_t *req) {
     // CORS header — allow browser to query directly
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-    int count = flash_audio_get_file_count();
+    const int count = flash_audio_get_file_count();
+    if (count < 0 || count > FLASH_AUDIO_MAX_FILES) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "Invalid flash file count");
+        return ESP_FAIL;
+    }
     uint32_t total_size = 0;
 
-    char json[4096];
-    int pos = snprintf(json, sizeof(json), "{\"count\":%d,\"files\":[", count);
-
-    for (int i = 0; i < count; i++) {
-        flash_audio_info_t info;
-        flash_audio_get_file_info(i, &info);
-        total_size += info.size;
-        if (i > 0) pos += snprintf(json + pos, sizeof(json) - pos, ",");
-        pos += snprintf(json + pos, sizeof(json) - pos,
-                       R"({"name":"%s","size":%lu,"sample_rate":%lu})",
-                       info.name, (unsigned long)info.size,
-                       (unsigned long)info.sample_rate);
+    httpd_resp_set_type(req, "application/json");
+    char chunk[256];
+    int len = snprintf(chunk, sizeof(chunk), "{\"count\":%d,\"files\":[", count);
+    if (len < 0 || (size_t)len >= sizeof(chunk) ||
+        httpd_resp_send_chunk(req, chunk, len) != ESP_OK) {
+        return ESP_FAIL;
     }
 
-    snprintf(json + pos, sizeof(json) - pos,
-             "],\"total_size\":%lu}", (unsigned long)total_size);
+    for (int i = 0; i < count; i++) {
+        flash_audio_info_t info = {};
+        if (flash_audio_get_file_info(i, &info) != ESP_OK) return ESP_FAIL;
+        total_size += info.size;
+        char escaped_name[FLASH_AUDIO_FILENAME_MAX * 2 + 1];
+        EscapeJsonString(info.name, escaped_name, sizeof(escaped_name));
+        len = snprintf(chunk, sizeof(chunk),
+                       R"(%s{"name":"%s","size":%lu,"sample_rate":%lu})",
+                       i ? "," : "", escaped_name,
+                       (unsigned long)info.size, (unsigned long)info.sample_rate);
+        if (len < 0 || (size_t)len >= sizeof(chunk) ||
+            httpd_resp_send_chunk(req, chunk, len) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
+    len = snprintf(chunk, sizeof(chunk), "],\"total_size\":%lu}",
+                   (unsigned long)total_size);
+    if (len < 0 || (size_t)len >= sizeof(chunk) ||
+        httpd_resp_send_chunk(req, chunk, len) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return httpd_resp_send_chunk(req, nullptr, 0);
 }
 
 static esp_err_t HandleFlashUpload(httpd_req_t *req) {

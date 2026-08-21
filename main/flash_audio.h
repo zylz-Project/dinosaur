@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include "esp_err.h"
+#include "external_flash.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,7 +12,7 @@ extern "C" {
 /* ==========================================================================
    Flash Layout
    ==========================================================================
-   Sector 0 (0x000000, 4KB): TOC (Table of Contents)
+   Erase unit 0 (0x000000): TOC (Table of Contents, first 4KB used)
      [0..3]   Magic: "PNDA"
      [4..7]   Version: uint32_t (2)
      [8..11]  File count: uint32_t (N)
@@ -23,15 +24,15 @@ extern "C" {
        [76..79]  Duration in milliseconds (uint32_t, estimated)
        [80..95]  Category (UTF-8, null-padded, 16 bytes) — "animal" or "ambient"
 
-   Sector 1+ (0x001000+): Opus file data
-     Each file stored contiguously, aligned to 4KB sector boundary
+   Erase unit 1+: Opus file data
+     Each file is aligned to the selected chip's erase size (4KB NOR / 128KB NAND)
 
    Firmware reads all file metadata from TOC — no hardcoded filenames needed.
    To change audio files, rebuild opus_data.bin and reflash; firmware unchanged.
    ========================================================================== */
 
 #define FLASH_AUDIO_TOC_SECTOR    0
-#define FLASH_AUDIO_DATA_START    0x001000  // Sector 1
+#define FLASH_AUDIO_DATA_START    EXTERNAL_FLASH_ERASE_SIZE
 #define FLASH_AUDIO_MAX_FILES     32
 #define FLASH_AUDIO_FILENAME_MAX  64
 #define FLASH_AUDIO_ENTRY_SIZE    96       // 64 + 4*4 + 16 (category)
@@ -139,9 +140,13 @@ typedef struct {
     char     category[FLASH_AUDIO_CATEGORY_MAX];
     uint32_t total_size;
     uint32_t written;
+    uint32_t programmed;    // bytes already committed as complete flash pages
     uint32_t flash_addr;    // absolute flash address being written to
     uint32_t data_offset;   // offset within data area (for TOC)
     int      existing_idx;  // -1 if new, else index to replace
+    uint8_t *pending_buf;   // collects arbitrary network chunks into one page
+    size_t   pending_len;
+    bool     failed;
     bool     active;
 } flash_audio_stream_t;
 

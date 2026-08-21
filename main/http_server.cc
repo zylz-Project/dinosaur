@@ -1,5 +1,6 @@
 #include "http_server.h"
 #include "audio.h"
+#include "auto_run.h"
 #include "config.h"
 #include "dino_samples.h"
 #include "flash_audio.h"
@@ -18,14 +19,6 @@
 static const char *TAG = "dino_http";
 
 httpd_handle_t g_http_server = nullptr;
-
-// Forward declaration for auto_run
-#if ENABLE_AUTO_RUN
-extern bool IsAutoRunRunning();
-extern void SetAutoRunRunning(bool v);
-extern bool IsAutoRunHardSwing();
-extern void SetAutoRunHardSwing(bool v);
-#endif
 
 // ======================== Embedded Web UI ========================
 static const char kHtml[] = R"raw(
@@ -61,12 +54,12 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;heigh
 <div class="status" id="status">Ready</div>
 
 <div class="card grp-neck">
-<h2>Neck 脖子 (IO15: tilt 前后  IO16: lean 左右)</h2>
+<h2>Neck 脖子 (IO17: up/down 上下  IO16: left/right 左右)</h2>
 <div class="row">
 <div class="col">
-<div class="lbl"><span>Tilt (IO15) 前后</span><span class="val" id="v0">90°</span></div>
-<input type="range" id="s0" min="0" max="180" value="90" oninput="onSlider()">
-<div style="font-size:10px;color:#888;text-align:center">0°=后仰 | 90°=中位 | 180°=前倾</div>
+<div class="lbl"><span>UD (IO17) 上下</span><span class="val" id="v0">70°</span></div>
+<input type="range" id="s0" min="0" max="180" value="70" oninput="onSlider()">
+<div style="font-size:10px;color:#888;text-align:center">0°=最上 | 90°=中位 | 180°=最下</div>
 </div>
 </div>
 <div class="row">
@@ -79,10 +72,10 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;heigh
 </div>
 
 <div class="card grp-head">
-<h2>Head 头部 (IO17: turn 转头)</h2>
+<h2>Head 头部 (IO15: turn 转头)</h2>
 <div class="row">
 <div class="col">
-<div class="lbl"><span>Turn (IO17) 转头</span><span class="val" id="v2">90°</span></div>
+<div class="lbl"><span>Turn (IO15) 转头</span><span class="val" id="v2">90°</span></div>
 <input type="range" id="s2" min="0" max="180" value="90" oninput="onSlider()">
 <div style="font-size:10px;color:#888;text-align:center">0°=右转 | 90°=中位 | 180°=左转</div>
 </div>
@@ -90,19 +83,19 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;heigh
 </div>
 
 <div class="card grp-tail">
-<h2>Tail 尾巴 (IO18: up/down 上下  IO8: left/right 左右)</h2>
+<h2>Tail 尾巴 (IO18: left/right 左右  IO8: up/down 上下)</h2>
 <div class="row">
 <div class="col">
-<div class="lbl"><span>UD (IO18) 上下</span><span class="val" id="v3">90°</span></div>
-<input type="range" id="s3" min="0" max="180" value="90" oninput="onSlider()">
-<div style="font-size:10px;color:#888;text-align:center">0°=上翘 | 90°=中位 | 180°=下垂</div>
+<div class="lbl"><span>UD (IO8) 上下</span><span class="val" id="v3">90°</span></div>
+<input type="range" id="s3" min="55" max="180" value="90" oninput="onSlider()">
+<div style="font-size:10px;color:#888;text-align:center">55°=最下 | 90°=中位 | 180°=最上</div>
 </div>
 </div>
 <div class="row">
 <div class="col">
-<div class="lbl"><span>LR (IO8) 左右</span><span class="val" id="v4">90°</span></div>
+<div class="lbl"><span>LR (IO18) 左右</span><span class="val" id="v4">90°</span></div>
 <input type="range" id="s4" min="0" max="180" value="90" oninput="onSlider()">
-<div style="font-size:10px;color:#888;text-align:center">180°=最左</div>
+<div style="font-size:10px;color:#888;text-align:center">0°=最左 | 90°=中位 | 180°=最右</div>
 </div>
 </div>
 </div>
@@ -110,18 +103,36 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;heigh
 <div class="card">
 <h2>Quick Presets</h2>
 <div class="row">
+<button class="btn btn-reset" onclick="preset(70,90,90,90,90)">默认抬颈</button>
 <button class="btn btn-reset" onclick="preset(90,90,90,90,90)">全部中位</button>
-<button class="btn btn-reset" onclick="preset(45,90,90,90,90)">脖子后仰</button>
-<button class="btn btn-reset" onclick="preset(135,90,90,90,90)">脖子前倾</button>
+<button class="btn btn-reset" onclick="preset(0,90,90,180,90)">仰天长啸</button>
+<button class="btn btn-reset" onclick="preset(180,90,90,90,90)">低头吃东西</button>
 <button class="btn btn-reset" onclick="preset(90,45,90,90,90)">脖子右倾</button>
 <button class="btn btn-reset" onclick="preset(90,135,90,90,90)">脖子左倾</button>
 </div>
 <div class="row" style="margin-top:3px">
 <button class="btn btn-reset" onclick="preset(90,90,45,90,90)">头右转</button>
 <button class="btn btn-reset" onclick="preset(90,90,135,90,90)">头左转</button>
-<button class="btn btn-reset" onclick="preset(90,90,90,30,90)">尾巴上翘</button>
-<button class="btn btn-reset" onclick="preset(90,90,90,150,90)">尾巴下垂</button>
-<button class="btn btn-reset" onclick="preset(90,90,90,90,180)">尾巴最左</button>
+<button class="btn btn-reset" onclick="preset(90,90,90,180,90)">尾巴上翘</button>
+<button class="btn btn-reset" onclick="preset(90,90,90,55,90)">尾巴下垂</button>
+<button class="btn btn-reset" onclick="preset(90,90,90,90,0)">尾巴最左</button>
+<button class="btn btn-reset" onclick="preset(90,90,90,90,180)">尾巴最右</button>
+</div>
+</div>
+
+<div class="card">
+<h2>萌宠动作库（点击即可试演）</h2>
+<div class="row">
+<button class="btn btn-set" onclick="action(0)">发现你了</button>
+<button class="btn btn-set" onclick="action(1)">贴贴撒娇</button>
+<button class="btn btn-set" onclick="action(2)">雀跃开心</button>
+<button class="btn btn-set" onclick="action(3)">威风鸣叫</button>
+</div>
+<div class="row">
+<button class="btn btn-reset" onclick="action(4)">低头进食</button>
+<button class="btn btn-reset" onclick="action(5)">听声定位</button>
+<button class="btn btn-reset" onclick="action(6)">受惊恢复</button>
+<button class="btn btn-reset" onclick="action(7)">困倦入睡</button>
 </div>
 </div>
 
@@ -161,6 +172,11 @@ async function sendAngles(){
   await api('/api/servo', {angles:a});
 }
 
+async function action(id){
+  let r=await api('/api/action',{action:id});
+  if(r&&r.ok)setStatus('Action queued: '+id,'#4ecca3');
+}
+
 // Poll battery every 5s
 setInterval(async ()=>{
   let r = await api('/api/battery');
@@ -189,7 +205,9 @@ static esp_err_t HandleServo(httpd_req_t *req)
   if (ret <= 0) { httpd_resp_send_500(req); return ESP_FAIL; }
   buf[ret] = 0;
 
-  int angles[5] = {90, 90, 90, 90, 90};
+  int angles[5] = {SERVO_NECK_TILT_DEFAULT, SERVO_NECK_LEAN_DEFAULT,
+                   SERVO_HEAD_TURN_DEFAULT, SERVO_TAIL_UD_DEFAULT,
+                   SERVO_TAIL_LR_DEFAULT};
   const char *p = strstr(buf, "\"angles\":");
   if (p) {
     p += 9;
@@ -218,6 +236,27 @@ static esp_err_t HandleBattery(httpd_req_t *req)
 }
 
 #if ENABLE_AUTO_RUN
+static esp_err_t HandleAction(httpd_req_t *req)
+{
+    char buf[96] = {};
+    int received = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (received <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[received] = 0;
+    const char *p = strstr(buf, "\"action\":");
+    int action = p ? atoi(p + 9) : -1;
+    bool ok = action >= 0 && action < DINO_ACTION_COUNT;
+    if (ok) {
+        SetAutoRunRunning(true);
+        ok = TriggerDinoActionWithAutoSound(static_cast<DinoAction>(action));
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    return ESP_OK;
+}
+
 static esp_err_t HandleAutoPlay(httpd_req_t *req)
 {
     if (req->method == HTTP_POST) {
@@ -256,6 +295,9 @@ void StartHttpServer()
   httpd_register_uri_handler(g_http_server, &batt);
 
 #if ENABLE_AUTO_RUN
+  httpd_uri_t action = {.uri = "/api/action", .method = HTTP_POST, .handler = HandleAction, .user_ctx = nullptr};
+  httpd_register_uri_handler(g_http_server, &action);
+
   httpd_uri_t auto_play = {.uri = "/api/autoplay", .method = HTTP_GET, .handler = HandleAutoPlay, .user_ctx = nullptr};
   httpd_register_uri_handler(g_http_server, &auto_play);
   {

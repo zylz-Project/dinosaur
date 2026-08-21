@@ -7,6 +7,7 @@
 #include <esp_log.h>
 #include <esp_mac.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/event_groups.h>
 #include <freertos/task.h>
 #include <nvs.h>
 
@@ -20,10 +21,12 @@ constexpr char kNamespace[] = "audio_hub";
 constexpr char kApiTokenKey[] = "api_token";
 constexpr char kClaimTokenKey[] = "claim_token";
 constexpr char kActivationCodeKey[] = "act_code";
-constexpr size_t kTokenSize = 96;
+constexpr size_t kTokenSize = DEVICE_API_TOKEN_SIZE;
 constexpr int kHeartbeatSeconds = 60;
+constexpr EventBits_t kActivatedBit = BIT0;
 static const char *TAG = "device_registry";
 TaskHandle_t g_task = nullptr;
+EventGroupHandle_t g_state = nullptr;
 
 struct Response {
     char *data = nullptr;
@@ -212,7 +215,7 @@ bool poll_activation(const char *device_id, const char *claim_token, char *api_t
     return true;
 }
 
-void check_in(const char *api_token)
+int check_in(const char *api_token)
 {
     char request_body[128];
     const esp_app_desc_t *app = esp_app_get_description();
@@ -231,6 +234,21 @@ void check_in(const char *api_token)
         ESP_LOGW(TAG, "心跳上报失败: HTTP %d", status);
     }
     free(response.data);
+    return status;
+}
+
+void wait_until_token_verified(const char *api_token)
+{
+    while (true) {
+        const int status = check_in(api_token);
+        if (status >= 200 && status < 300) {
+            xEventGroupSetBits(g_state, kActivatedBit);
+            return;
+        }
+        const int retry_seconds = (status == 401 || status == 403) ? 60 : 5;
+        ESP_LOGW(TAG, "%d 秒后重新验证设备令牌", retry_seconds);
+        vTaskDelay(pdMS_TO_TICKS(retry_seconds * 1000));
+    }
 }
 
 void registry_task(void *)
@@ -244,6 +262,10 @@ void registry_task(void *)
     load_secret(kClaimTokenKey, claim_token, sizeof(claim_token));
     load_secret(kActivationCodeKey, activation_code, sizeof(activation_code));
     ESP_LOGI(TAG, "设备 ID: %s, 产品: %s", device_id, SYNC_PRODUCT_ID);
+
+    if (api_token[0]) {
+        wait_until_token_verified(api_token);
+    }
 
     while (!api_token[0]) {
         if (!claim_token[0]) {
@@ -265,11 +287,16 @@ void registry_task(void *)
                 continue;
             }
             vTaskDelay(pdMS_TO_TICKS(3000));
+        } else {
+            wait_until_token_verified(api_token);
         }
     }
 
     while (true) {
-        check_in(api_token);
+        const int status = check_in(api_token);
+        if (status == 401 || status == 403) {
+            xEventGroupClearBits(g_state, kActivatedBit);
+        }
         vTaskDelay(pdMS_TO_TICKS(kHeartbeatSeconds * 1000));
     }
 }
@@ -279,9 +306,34 @@ void registry_task(void *)
 void device_registry_start(void)
 {
     if (g_task) return;
+    if (!g_state) {
+        g_state = xEventGroupCreate();
+        if (!g_state) {
+            ESP_LOGE(TAG, "无法创建设备状态事件组");
+            return;
+        }
+    }
     if (xTaskCreate(registry_task, "device_registry", 6144, nullptr, 4, &g_task)
         != pdPASS) {
         g_task = nullptr;
         ESP_LOGE(TAG, "无法创建设备注册任务");
     }
+}
+
+bool device_registry_wait_for_activation(TickType_t timeout_ticks)
+{
+    if (!g_state) return false;
+    const EventBits_t bits = xEventGroupWaitBits(
+        g_state, kActivatedBit, pdFALSE, pdTRUE, timeout_ticks);
+    return (bits & kActivatedBit) != 0;
+}
+
+bool device_registry_get_api_token(char *output, size_t output_size)
+{
+    if (!output || output_size == 0 || !g_state ||
+        !(xEventGroupGetBits(g_state) & kActivatedBit)) {
+        if (output && output_size) output[0] = '\0';
+        return false;
+    }
+    return load_secret(kApiTokenKey, output, output_size);
 }

@@ -1,5 +1,7 @@
 #include "power.h"
 #include "config.h"
+#include "servo.h"
+#include "audio.h"
 
 #include <driver/gpio.h>
 #include <esp_adc/adc_cali.h>
@@ -27,9 +29,28 @@ static int AdcToMv(int raw)
   return raw * 3300 / 4096;
 }
 
-void InitPower()
+// --- Power-button state machine ----------------------------------------------
+// Mirrors the testBoard reference: debounce on both edges, long-press on the
+// PRESSED state, and a boot-hold "armed" guard so that the button being held to
+// switch the device on is never mistaken for a shutdown request.
+typedef enum {
+  BTN_IDLE = 0,
+  BTN_DEBOUNCE_PRESS,
+  BTN_PRESSED,
+  BTN_DEBOUNCE_RELEASE,
+} power_btn_state_t;
+
+static power_btn_state_t s_btn_state = BTN_IDLE;
+static uint32_t s_btn_state_since = 0;  // ms (esp_log_timestamp)
+static uint32_t s_btn_press_start = 0;  // ms
+static int s_btn_hold_tip = 0;          // last progress hint (500ms steps)
+// Long-press shutdown is inert until the button has been released once after
+// boot — at power-on the button is necessarily held, and we must not fire then.
+static bool s_btn_armed = false;
+static bool s_btn_boot_hold_logged = false;
+
+static void PowerLatchInit()
 {
-  // --- POWER_CTRL (IO7): latch HIGH immediately ---
   gpio_config_t pwr_ctrl = {
       .pin_bit_mask = 1ULL << POWER_CTRL_GPIO,
       .mode = GPIO_MODE_OUTPUT,
@@ -40,19 +61,39 @@ void InitPower()
   gpio_config(&pwr_ctrl);
   gpio_set_level(POWER_CTRL_GPIO, 1);
   ESP_LOGI(TAG, "POWER_CTRL IO%d HIGH, power latched", POWER_CTRL_GPIO);
+}
 
-  // POWER_OUT (IO6): ADC monitoring via ADC1_CH5
-  gpio_config_t pwr_out = {
-      .pin_bit_mask = 1ULL << POWER_OUT_GPIO,
-      .mode = GPIO_MODE_INPUT,
-      .pull_up_en = GPIO_PULLUP_ENABLE,
-      .pull_down_en = GPIO_PULLDOWN_DISABLE,
-      .intr_type = GPIO_INTR_DISABLE,
-  };
-  gpio_config(&pwr_out);
-  gpio_hold_en(POWER_OUT_GPIO);
+// Full shutdown: chime → center servos → cut servo power → release latch.
+static void ShutdownSequence()
+{
+  ESP_LOGW(TAG, "⏻ Long press %dms — running shutdown sequence", POWER_LONG_PRESS_MS);
 
-  // ADC init
+  // 0. Power-off chime (synchronous, independent of Flash audio).
+  PlayShutdownTone();
+
+  // 1. Return every servo to a neutral 90° before de-powering.
+  for (int i = 0; i < kServoCount; ++i)
+    SetServoAngle(i, 90);
+  vTaskDelay(pdMS_TO_TICKS(300));
+
+  // 2. Cut the servo power rail.
+  gpio_set_level(SERVO_POWER_GPIO, 0);
+  ESP_LOGI(TAG, "Servo power IO%d LOW", SERVO_POWER_GPIO);
+  vTaskDelay(pdMS_TO_TICKS(300));
+
+  // 3. Release the power latch — board powers down.
+  gpio_set_level(POWER_CTRL_GPIO, 0);
+  ESP_LOGW(TAG, "POWER_CTRL IO%d LOW, system powering off", POWER_CTRL_GPIO);
+
+  while (true)
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+void InitPower()
+{
+  PowerLatchInit();
+
+  // ADC init: IO6 power button (CH5), IO3 battery (CH2).
   adc_oneshot_unit_init_cfg_t adc_cfg = {
       .unit_id = ADC_UNIT_1,
       .clk_src = ADC_RTC_CLK_SRC_DEFAULT,
@@ -61,8 +102,8 @@ void InitPower()
   if (adc_oneshot_new_unit(&adc_cfg, &adc_handle_) == ESP_OK)
   {
     adc_oneshot_chan_cfg_t ch = {.atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_12};
-    adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_5, &ch);      // IO6 power button
-    adc_oneshot_config_channel(adc_handle_, BATTERY_ADC_CHANNEL, &ch); // IO3 battery
+    adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_5, &ch);        // IO6 power button
+    adc_oneshot_config_channel(adc_handle_, BATTERY_ADC_CHANNEL, &ch);  // IO3 battery
 
     adc_cali_curve_fitting_config_t cali = {
         .unit_id = ADC_UNIT_1,
@@ -73,86 +114,116 @@ void InitPower()
     adc_cali_create_scheme_curve_fitting(&cali, &adc_cali_handle_);
   }
 
-  // Power monitor task: symmetric hysteresis debounce + long-press shutdown + battery
+  // Power monitor: button state machine + long-press shutdown + battery.
   xTaskCreate([](void *)
               {
-    vTaskDelay(pdMS_TO_TICKS(5000)); // Wait for stabilization
+    vTaskDelay(pdMS_TO_TICKS(3000));  // let the boot-time button hold settle
 
-    // Symmetric hysteresis debounce state
-    int pwr_stable = 1;       // Debounced state: 1=released, 0=pressed
-    int pwr_debounce = 5;     // Debounce counter
-    uint32_t pwr_hold_ms = 0; // Pressed duration
-    uint32_t tick = 0;
-
-    const int debounce_max = POWER_DEBOUNCE_MS / POWER_POLL_MS;
+    uint32_t bat_elapsed = 0;
 
     while (true) {
-        tick++;
+      const uint32_t now = esp_log_timestamp();
 
-        // --- Read power button ADC ---
-        int raw = 0;
-        adc_oneshot_read(adc_handle_, ADC_CHANNEL_5, &raw);
-        int raw_high = (raw > POWER_ADC_THRESHOLD) ? 1 : 0;  // >1241=released
+      // --- Power button (IO6 ADC) ---
+      int raw = 0;
+      adc_oneshot_read(adc_handle_, ADC_CHANNEL_5, &raw);
+      bool pressed = (raw < POWER_ADC_THRESHOLD);  // <~1V = pressed
+      int hold_ms = 0;
 
-        // Symmetric hysteresis debounce
-        if (raw_high == pwr_stable) {
-            if (pwr_debounce < debounce_max) pwr_debounce++;
+      switch (s_btn_state) {
+        case BTN_IDLE:
+          if (pressed) {
+            s_btn_state = BTN_DEBOUNCE_PRESS;
+            s_btn_state_since = now;
+          } else if (!s_btn_armed) {
+            // First confirmed release after boot arms long-press shutdown.
+            s_btn_armed = true;
+            s_btn_boot_hold_logged = false;
+            ESP_LOGI(TAG, "✅ Power button released — long-press shutdown armed");
+          }
+          break;
+
+        case BTN_DEBOUNCE_PRESS:
+          if (!pressed) {
+            s_btn_state = BTN_IDLE;  // glitch, reset
+          } else if (now - s_btn_state_since >= POWER_DEBOUNCE_MS) {
+            if (!s_btn_armed) {
+              // Held continuously since boot — ignore until released.
+              if (!s_btn_boot_hold_logged) {
+                s_btn_boot_hold_logged = true;
+                ESP_LOGI(TAG, "🫣 Boot-time hold ignored (shutdown arms after release)");
+              }
+              s_btn_state = BTN_IDLE;
+              break;
+            }
+            s_btn_state = BTN_PRESSED;
+            s_btn_press_start = now;
+            s_btn_hold_tip = 0;
+            ESP_LOGI(TAG, "🔘 Power button pressed (raw=%d)", raw);
+          }
+          break;
+
+        case BTN_PRESSED:
+          if (!pressed) {
+            s_btn_state = BTN_DEBOUNCE_RELEASE;
+            s_btn_state_since = now;
+          } else {
+            hold_ms = static_cast<int>(now - s_btn_press_start);
+            if (hold_ms >= POWER_LONG_PRESS_MS)
+              ShutdownSequence();  // long press reached → shutdown
+            int tip = hold_ms / 500;
+            if (tip != s_btn_hold_tip && tip > 0) {
+              s_btn_hold_tip = tip;
+              ESP_LOGI(TAG, "⏳ Holding %d.%ds (need %ds, release to cancel)",
+                       hold_ms / 1000, (hold_ms % 1000) / 100, POWER_LONG_PRESS_MS / 1000);
+            }
+          }
+          break;
+
+        case BTN_DEBOUNCE_RELEASE:
+          if (pressed) {
+            s_btn_state = BTN_PRESSED;  // not fully released
+          } else if (now - s_btn_state_since >= POWER_DEBOUNCE_MS) {
+            int dur = s_btn_press_start ? static_cast<int>(now - s_btn_press_start) : 0;
+            ESP_LOGI(TAG, "🔘 Power button released (held %dms)", dur);
+            if (dur < POWER_LONG_PRESS_MS)
+              ESP_LOGI(TAG, "   Short press ignored (need %dms to shut down)", POWER_LONG_PRESS_MS);
+            s_btn_state = BTN_IDLE;
+            s_btn_press_start = 0;
+          }
+          break;
+      }
+
+      // --- Battery (IO3, 32× oversample + 1st-order filter, every 5s) ---
+      bat_elapsed += POWER_POLL_MS;
+      if (bat_elapsed >= BATTERY_READ_TICKS * POWER_POLL_MS) {
+        bat_elapsed = 0;
+        int64_t bat_sum = 0;
+        for (int n = 0; n < 32; ++n) {
+          int bat_raw = 0;
+          adc_oneshot_read(adc_handle_, BATTERY_ADC_CHANNEL, &bat_raw);
+          bat_sum += bat_raw;
+        }
+        int bat_avg = static_cast<int>(bat_sum / 32);
+        int vpin_mv = AdcToMv(bat_avg);
+        int vbat_mv = static_cast<int>(vpin_mv * BATTERY_DIVIDER_RATIO);
+        if (battery_vbat_filtered_mv_ == 0) {
+          battery_vbat_filtered_mv_ = vbat_mv;
         } else {
-            if (pwr_debounce > 0) pwr_debounce--;
-            else { pwr_stable = raw_high; pwr_debounce = 1; }
+          battery_vbat_filtered_mv_ += (vbat_mv - battery_vbat_filtered_mv_) / 5;
         }
+        int vbat_f = battery_vbat_filtered_mv_;
+        battery_level_ = (vbat_f - BATTERY_EMPTY_VOLTAGE_MV) * 100 /
+                         (BATTERY_FULL_VOLTAGE_MV - BATTERY_EMPTY_VOLTAGE_MV);
+        if (battery_level_ < 0) battery_level_ = 0;
+        if (battery_level_ > 100) battery_level_ = 100;
+        ESP_LOGI(TAG, "[BAT] %dmV (filt=%dmV) level=%d%%",
+                 vbat_mv, vbat_f, battery_level_);
+      }
 
-        // Edge detection
-        static int prev_stable = 1;
-        if (pwr_stable != prev_stable) {
-            if (!pwr_stable) {
-                ESP_LOGI(TAG, "Power button PRESSED");
-                pwr_hold_ms = 0;
-            } else {
-                ESP_LOGI(TAG, "Power button RELEASED (held %dms)", (int)pwr_hold_ms);
-                // Shutdown on release if long-press threshold met
-                if (pwr_hold_ms >= POWER_LONG_PRESS_MS) {
-                    ESP_LOGW(TAG, "Long press %dms -> SHUTDOWN (IO%d -> LOW)",
-                             POWER_LONG_PRESS_MS, POWER_CTRL_GPIO);
-                    gpio_set_level(POWER_CTRL_GPIO, 0);
-                }
-            }
-            prev_stable = pwr_stable;
-        }
-
-        // Long-press timing
-        if (!pwr_stable) {
-            pwr_hold_ms += POWER_POLL_MS;
-        }
-
-        // --- Battery voltage (IO3) — every 5s ---
-        if (tick % BATTERY_READ_TICKS == 0) {
-            int64_t bat_sum = 0;
-            for (int n = 0; n < 32; n++) {
-                int bat_raw = 0;
-                adc_oneshot_read(adc_handle_, BATTERY_ADC_CHANNEL, &bat_raw);
-                bat_sum += bat_raw;
-            }
-            int bat_avg = static_cast<int>(bat_sum / 32);
-            int vpin_mv = AdcToMv(bat_avg);
-            int vbat_mv = static_cast<int>(vpin_mv * BATTERY_DIVIDER_RATIO);
-            if (battery_vbat_filtered_mv_ == 0) {
-                battery_vbat_filtered_mv_ = vbat_mv;
-            } else {
-                battery_vbat_filtered_mv_ += (vbat_mv - battery_vbat_filtered_mv_) / 5;
-            }
-            int vbat_f = battery_vbat_filtered_mv_;
-            battery_level_ = (vbat_f - BATTERY_EMPTY_VOLTAGE_MV) * 100 /
-                             (BATTERY_FULL_VOLTAGE_MV - BATTERY_EMPTY_VOLTAGE_MV);
-            if (battery_level_ < 0) battery_level_ = 0;
-            if (battery_level_ > 100) battery_level_ = 100;
-            ESP_LOGI(TAG, "[BAT] %dmV (filt=%dmV) level=%d%%",
-                     vbat_mv, vbat_f, battery_level_);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(POWER_POLL_MS));
+      vTaskDelay(pdMS_TO_TICKS(POWER_POLL_MS));
     } }, "dino_power", 4096, nullptr, 1, nullptr);
-  ESP_LOGI(TAG, "Power monitor started (IO6 ADC, long press %dms, debounce %dms)",
+  ESP_LOGI(TAG, "Power monitor started (long press %dms, debounce %dms)",
            POWER_LONG_PRESS_MS, POWER_DEBOUNCE_MS);
 }
 

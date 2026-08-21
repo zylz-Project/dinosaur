@@ -36,6 +36,8 @@ void SetServoAngle(int idx, int angle)
 {
   if (idx < 0 || idx >= kServoCount) return;
   angle = std::clamp(angle, 0, SERVO_MAX_ANGLE);
+  if (idx == SERVO_TAIL_UD)
+    angle = std::clamp(angle, SERVO_TAIL_UD_MIN, SERVO_TAIL_UD_MAX);
   servo_angles_[idx] = angle;
   uint32_t duty = AngleToDuty(angle);
   ledc_set_duty(LEDC_LOW_SPEED_MODE, kServoCh[idx], duty);
@@ -101,4 +103,5 @@ void InitServos()
   ESP_LOGI(TAG, "Servos initialized: neck_tilt=%d neck_lean=%d head_turn=%d tail_ud=%d tail_lr=%d",
            servo_angles_[0], servo_angles_[1], servo_angles_[2],
            servo_angles_[3], servo_angles_[4]);
+  ESP_LOGI(TAG, "Servo map: head=IO15 neck_lr=IO16 neck_ud=IO17 tail_lr=IO18 tail_ud=IO8");
 }

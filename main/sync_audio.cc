@@ -72,7 +72,8 @@ static esp_err_t http_buf_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static esp_err_t http_get_buf(const char *url, http_buf_t *out, int timeout_ms)
+static esp_err_t http_get_buf(const char *url, const char *api_token,
+                              http_buf_t *out, int timeout_ms)
 {
     out->data = (uint8_t *)malloc(4096);
     if (!out->data) return ESP_ERR_NO_MEM;
@@ -89,6 +90,9 @@ static esp_err_t http_get_buf(const char *url, http_buf_t *out, int timeout_ms)
 
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
     if (!cli) { free(out->data); out->data = nullptr; return ESP_FAIL; }
+    char authorization[128];
+    snprintf(authorization, sizeof(authorization), "Bearer %s", api_token);
+    esp_http_client_set_header(cli, "Authorization", authorization);
 
     esp_err_t ret = esp_http_client_perform(cli);
     int status = esp_http_client_get_status_code(cli);
@@ -148,10 +152,11 @@ static esp_err_t stream_handler(esp_http_client_event_t *evt)
 }
 
 static esp_err_t download_stream(int index, int total, const char *fname,
-                                  uint32_t fsize, flash_audio_stream_t *s)
+                                  uint32_t fsize, flash_audio_stream_t *s,
+                                  const char *api_token)
 {
     char url[128];
-    snprintf(url, sizeof(url), "%s/api/download-idx/%d?product=%s", g_base_url, index, SYNC_PRODUCT_ID);
+    snprintf(url, sizeof(url), "%s/api/device/v1/download/%d", g_base_url, index);
 
     stream_ctx_t ctx = { .flash = s, .fname = fname,
                          .idx = index + 1, .total = total,
@@ -166,6 +171,9 @@ static esp_err_t download_stream(int index, int total, const char *fname,
 
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
     if (!cli) return ESP_FAIL;
+    char authorization[128];
+    snprintf(authorization, sizeof(authorization), "Bearer %s", api_token);
+    esp_http_client_set_header(cli, "Authorization", authorization);
 
     esp_err_t ret = esp_http_client_perform(cli);
     int status = esp_http_client_get_status_code(cli);
@@ -329,8 +337,12 @@ static const char *fmt_size(uint32_t bytes)
     return b;
 }
 
-esp_err_t sync_audio_files(void)
+esp_err_t sync_audio_files(const char *api_token)
 {
+    if (!api_token || !api_token[0]) {
+        ESP_LOGW(TAG, "Device is not activated; skip sync");
+        return ESP_ERR_INVALID_STATE;
+    }
     build_base_url();
 
     ESP_LOGI(TAG, "========================================");
@@ -340,11 +352,11 @@ esp_err_t sync_audio_files(void)
 
     // 1. Fetch manifest
     char url[128];
-    snprintf(url, sizeof(url), "%s/api/files?product=%s", g_base_url, SYNC_PRODUCT_ID);
+    snprintf(url, sizeof(url), "%s/api/device/v1/files", g_base_url);
     ESP_LOGI(TAG, "Fetch manifest: %s", url);
 
     http_buf_t buf = {};
-    esp_err_t ret = http_get_buf(url, &buf, 10000);
+    esp_err_t ret = http_get_buf(url, api_token, &buf, 10000);
     if (ret != ESP_OK || buf.data == nullptr) {
         ESP_LOGW(TAG, "Server unreachable, skip sync");
         return ESP_FAIL;
@@ -437,7 +449,7 @@ esp_err_t sync_audio_files(void)
             ? ESP_OK : ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Download base URL: %s/api/download-idx/<n>?product=%s", g_base_url, SYNC_PRODUCT_ID);
+    ESP_LOGI(TAG, "Download base URL: %s/api/device/v1/download/<n>", g_base_url);
 
     // 4. Download new/changed files
     int downloaded = 0, skipped = 0, failed = 0;
@@ -484,7 +496,7 @@ esp_err_t sync_audio_files(void)
             ret = flash_audio_stream_begin(
                 &stream, sf.name, sf.size, 48000, sf.category);
             if (ret == ESP_OK) {
-                ret = download_stream(idx, total, dn, sf.size, &stream);
+                ret = download_stream(idx, total, dn, sf.size, &stream, api_token);
                 last_written = stream.written;
                 if (ret == ESP_OK && stream.written == expect_size &&
                     flash_audio_stream_end(&stream) == ESP_OK) {

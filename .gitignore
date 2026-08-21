@@ -65,7 +65,6 @@ env/
 .clangd/
 .ccls-cache/
 compile_commands.json
-.vscode/
 
 # Windows specific
 Thumbs.db
