@@ -16,10 +16,50 @@ CONFIG_FREERTOS_HZ=1000
 # Enable SPI Flash
 CONFIG_SPI_FLASH_ENABLE_COUNTERS=y
 
-# Increase main task stack (default 3584→8192) to avoid overflow during init
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
-
 # WiFi
 CONFIG_ESP_WIFI_SSID="huachuang109"
 CONFIG_ESP_WIFI_PASSWORD="huachuang109"
 CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=y
+
+# Realtime audio does JSON/base64 work while driving I2S; match the reference
+# project's 240 MHz CPU setting to keep the decoder/response task schedulable.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# Realtime TTS chunks are about 5 KB after base64 expansion. A larger TCP
+# window prevents the server from stalling after nearly every audio chunk.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+
+# RX and TX must not share the websocket client's single legacy lock. Without
+# this, an incoming frame can make microphone/control sends time out repeatedly.
+CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
+CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=500
+
+# Increase stack sizes
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+CONFIG_HTTPD_TASK_STACK_SIZE=8192
+CONFIG_HTTPD_MAX_REQ_HANDLERS=20
+
+# Increase interrupt watchdog timeout (prevents SPI Flash + I2S conflict crashes)
+CONFIG_INT_WDT_TIMEOUT_MS=500
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=500
+
+# PSRAM (ESP32-S3-WROOM N16R8, quad). IGNORE_NOTFOUND keeps booting if absent.
+CONFIG_SPIRAM=y
+# CONFIG_SPIRAM_MODE_QUAD is not set
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+
+# mbedTLS default allocator: allocations larger than the 2KB threshold above
+# go to PSRAM, while small latency-sensitive objects remain internal.
+# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
+
+# Smaller TLS buffers (reduces heap pressure for WSS chat)
+CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH=y

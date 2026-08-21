@@ -1,12 +1,15 @@
 #include "http_server.h"
 #include "audio.h"
 #include "auto_run.h"
+#include "chat.h"
 #include "config.h"
 #include "dino_samples.h"
 #include "flash_audio.h"
 #include "flash_upload_server.h"
 #include "power.h"
 #include "servo.h"
+#include "wifi.h"
+#include "wifi_config.h"
 
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
@@ -52,6 +55,40 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;heigh
 <body>
 <h1>Dino Pet Controller</h1>
 <div class="status" id="status">Ready</div>
+
+<!-- WIFI -->
+<div class="card" id="wifiCard">
+<h2>WiFi</h2>
+<!-- 当前状态 (badge + 详情) -->
+<div class="row" style="justify-content:space-between;align-items:center;margin-bottom:6px">
+<span id="wifiBadge" style="font-size:12px;font-weight:bold;padding:4px 12px;border-radius:4px;color:#000;background:#555">--</span>
+<button type="button" class="btn btn-set" id="btnReconfig" onclick="enterPortal()" style="display:none">重新配网</button>
+</div>
+<div id="wifiDetail" style="font-size:12px;color:#aaa;margin-bottom:6px">--</div>
+<!-- 未连接/配网: 显示完整表单 -->
+<div id="wifiForm" style="display:none">
+<button type="button" class="btn btn-set" style="width:100%;margin-top:6px" onclick="scanWifi()">扫描附近 WiFi</button>
+<div id="wifiList" style="margin-top:6px;min-height:24px"></div>
+<div class="row" style="margin-top:6px">
+<div class="col" style="flex:1"><input id="wSsid" placeholder="WiFi SSID" style="width:100%"></div>
+</div>
+<div class="row">
+<div class="col" style="flex:1"><input id="wPass" placeholder="WiFi 密码" type="text" style="width:100%"></div>
+</div>
+<div class="row">
+<button type="button" class="btn btn-set" style="width:100%" onclick="saveWifi()">连接此 WiFi</button>
+</div>
+</div>
+</div>
+
+<!-- CHAT -->
+<div class="card">
+<h2>AI 对话 <span style="font-size:10px;color:#888">双击电源键切换</span></h2>
+<div class="row" style="justify-content:space-between">
+<span style="font-size:12px;color:#aaa" id="chatStatus">--</span>
+<button type="button" class="btn btn-set" onclick="toggleChat()">开/关对话</button>
+</div>
+</div>
 
 <div class="card grp-neck">
 <h2>Neck 脖子 (IO17: up/down 上下  IO16: left/right 左右)</h2>
@@ -185,6 +222,93 @@ setInterval(async ()=>{
 
 // Initial battery fetch
 (async ()=>{let r=await api('/api/battery');if(r)$('batt').textContent='Battery: '+r.voltage_mv+'mV | Level: '+r.level+'%';})();
+
+// --- WiFi ---
+async function apiTxt(url, body){
+  try{
+    let o = body ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)} : {method:'GET'};
+    let r = await fetch(url, o);
+    return await r.text();
+  }catch(e){ setStatus('连接失败','#e94560'); return null; }
+}
+function wifiShowForm(show){
+  $('wifiForm').style.display = show ? 'block' : 'none';
+  $('btnReconfig').style.display = show ? 'none' : 'inline-block';
+}
+async function updateWifiInfo(){
+  let r = await api('/api/wifi');
+  if(!r) return;
+  let badge = $('wifiBadge'), det = $('wifiDetail');
+  if(r.mode === 'connected'){
+    badge.textContent = '已连接';
+    badge.style.background = '#2ecc71';
+    det.textContent = 'SSID: ' + r.ssid + '   |   IP: ' + r.ip +
+                      (r.rssi !== undefined && r.rssi !== null ? '   |   信号: ' + r.rssi + 'dBm' : '');
+    wifiShowForm(false);
+  } else if(r.mode === 'portal'){
+    badge.textContent = '配网模式';
+    badge.style.background = '#f39c12';
+    det.textContent = '热点 Dino-XXXX 已开启: 手机连接后访问 192.168.4.1';
+    wifiShowForm(true);
+  } else {
+    badge.textContent = '未连接';
+    badge.style.background = '#e94560';
+    det.textContent = '已配置: ' + (r.saved_ssid || '无') + '   |   请选择 WiFi 重新连接';
+    wifiShowForm(true);
+  }
+}
+async function enterPortal(){
+  setStatus('正在进入配网模式...','#3498db');
+  await apiTxt('/api/wifi/portal', {});
+  setStatus('配网模式已开启：手机连接 Dino-XXXX 热点，访问 192.168.4.1', '#3498db');
+  await updateWifiInfo();
+}
+async function scanWifi(){
+  setStatus('正在扫描附近 WiFi...','#4ecca3');
+  $('wifiList').innerHTML = '<div style="color:#888;font-size:12px;padding:4px">扫描中，请稍候...</div>';
+  let r = await api('/api/wifi/scan');
+  setStatus('扫描完成','#4ecca3');
+  if(!r){ $('wifiList').innerHTML='<div style="color:#e94560;font-size:12px">扫描失败，请重试</div>'; return; }
+  if(!r.length){ $('wifiList').innerHTML='<div style="color:#888;font-size:12px">未发现 WiFi</div>'; return; }
+  let html='';
+  for(let a of r){
+    if(!a.ssid) continue;
+    let pad = a.rssi>=-65?'#2ecc71':(a.rssi>=-80?'#f39c12':'#e94560');
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 4px;border-bottom:1px solid #1a2a4a;font-size:13px" onclick="pickWifi(\''+a.ssid.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">'+
+            '<span>'+a.ssid+'</span><span style="color:'+pad+'">'+a.rssi+'dBm</span></div>';
+  }
+  $('wifiList').innerHTML = html;
+  setStatus('点击列表选择 WiFi','#4ecca3');
+}
+function pickWifi(ssid){ $('wSsid').value = ssid; $('wPass').focus(); }
+async function saveWifi(){
+  let ssid = $('wSsid').value.trim();
+  let pass = $('wPass').value.trim();
+  if(!ssid){ setStatus('请输入 SSID','#e94560'); $('wSsid').focus(); return; }
+  setStatus('正在保存并连接 '+ssid+'...','#4ecca3');
+  await apiTxt('/api/wifi/configure', {ssid:ssid, password:pass});
+  setStatus('已保存！正在连接新网络，热点稍后自动关闭...', '#4ecca3');
+  setTimeout(updateWifiInfo, 2500);
+}
+
+// --- Chat ---
+async function updateChat(){
+  let r = await api('/api/chat');
+  if(r){
+    $('chatStatus').textContent = r.active ? (r.ready ? '对话中 (服务端就绪)' : '对话中 (连接中...)') : '已关闭';
+    $('chatStatus').style.color = r.ready ? '#2ecc71' : (r.active ? '#f39c12' : '#888');
+  }
+}
+async function toggleChat(){
+  await apiTxt('/api/chat/toggle', {});
+  await updateChat();
+}
+setInterval(updateChat, 3000);
+updateChat();
+
+(async function(){ await updateWifiInfo(); })();
+// 每 3 秒刷新 WiFi 当前状态
+setInterval(updateWifiInfo, 3000);
 </script>
 </body>
 </html>
@@ -279,6 +403,115 @@ static esp_err_t HandleAutoPlay(httpd_req_t *req)
 }
 #endif
 
+static esp_err_t HandleWifiStatus(httpd_req_t *req)
+{
+    char buf[320];
+    bool online = (strcmp(WiFiIP(), "0.0.0.0") != 0);
+    bool portal = WifiConfigPortalRunning();
+
+    char cur_ssid[33] = {};
+    int rssi = -1;
+    if (online) WifiConnectedApInfo(cur_ssid, sizeof(cur_ssid), &rssi);
+
+    char saved_ssid[33] = {};
+    {
+        char p[65] = {};
+        if (WifiConfigGetCredentials(saved_ssid, sizeof(saved_ssid), p, sizeof(p)) && saved_ssid[0]) {
+            /* NVS 已保存的实际凭据 */
+        }
+#ifdef WIFI_STA_SSID
+        else strlcpy(saved_ssid, WIFI_STA_SSID, sizeof(saved_ssid));
+#else
+        else strlcpy(saved_ssid, "none", sizeof(saved_ssid));
+#endif
+    }
+
+    const char *mode = online ? "connected" : (portal ? "portal" : "offline");
+    snprintf(buf, sizeof(buf),
+             "{\"connected\":%s,\"mode\":\"%s\",\"ssid\":\"%s\",\"saved_ssid\":\"%s\","
+             "\"ip\":\"%s\",\"rssi\":%d,\"portal\":%s}",
+             online ? "true" : "false", mode, cur_ssid, saved_ssid,
+             WiFiIP(), rssi, portal ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t HandleWifiPortal(httpd_req_t *req)
+{
+    httpd_req_recv(req, nullptr, 0); /* discard body */
+    WifiConfigEnterFromWeb();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "portal started");
+    return ESP_OK;
+}
+
+static esp_err_t HandleWifiScan(httpd_req_t *req)
+{
+    char buf[1200];
+    WifiConfigScanAps(buf, sizeof(buf));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t HandleWifiConfigure(httpd_req_t *req)
+{
+    char body[512] = {};
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) { httpd_resp_send_500(req); return ESP_FAIL; }
+    body[len] = 0;
+
+    char ssid[33] = {}, pass[65] = {};
+    const char *ps = strstr(body, "\"ssid\"");
+    const char *pp = strstr(body, "\"password\"");
+    if (ps) {
+        ps = strchr(ps, ':'); ps = strchr(ps, '"');
+        const char *e = strchr(ps + 1, '"');
+        size_t n = (e && e > ps) ? (size_t)(e - ps - 1) : 0;
+        if (n >= sizeof(ssid)) n = sizeof(ssid) - 1;
+        memcpy(ssid, ps + 1, n);
+    }
+    if (pp) {
+        pp = strchr(pp, ':'); pp = strchr(pp, '"');
+        const char *e = strchr(pp + 1, '"');
+        size_t n = (e && e > pp) ? (size_t)(e - pp - 1) : 0;
+        if (n >= sizeof(pass)) n = sizeof(pass) - 1;
+        memcpy(pass, pp + 1, n);
+    }
+    if (!ssid[0]) { httpd_resp_set_type(req, "text/plain"); httpd_resp_sendstr(req, "no ssid"); return ESP_OK; }
+
+    WifiConfigSaveCredentials(ssid, pass);
+
+    /* 先回响应, 让手机收到"已保存"再关热点, 避免页面加载中断乱跳 */
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "ok");
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    WifiConfigStopPortal();  /* 保存后切回 STA 连接 */
+    return ESP_OK;
+}
+
+static esp_err_t HandleChatStatus(httpd_req_t *req)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"active\":%s,\"ready\":%s}",
+             ChatIsActive() ? "true" : "false",
+             ChatIsReady() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t HandleChatToggle(httpd_req_t *req)
+{
+    httpd_req_recv(req, nullptr, 0); /* discard body */
+    ChatToggle();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "ok");
+    return ESP_OK;
+}
+
 void StartHttpServer()
 {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -293,6 +526,29 @@ void StartHttpServer()
 
   httpd_uri_t batt = {.uri = "/api/battery", .method = HTTP_GET, .handler = HandleBattery, .user_ctx = nullptr};
   httpd_register_uri_handler(g_http_server, &batt);
+
+  httpd_uri_t wifi_status = {.uri = "/api/wifi", .method = HTTP_GET, .handler = HandleWifiStatus, .user_ctx = nullptr};
+  httpd_register_uri_handler(g_http_server, &wifi_status);
+  httpd_uri_t wifi_portal = {.uri = "/api/wifi/portal", .method = HTTP_POST, .handler = HandleWifiPortal, .user_ctx = nullptr};
+  httpd_register_uri_handler(g_http_server, &wifi_portal);
+  httpd_uri_t wifi_scan = {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = HandleWifiScan, .user_ctx = nullptr};
+  httpd_register_uri_handler(g_http_server, &wifi_scan);
+  httpd_uri_t wifi_cfg = {.uri = "/api/wifi/configure", .method = HTTP_POST, .handler = HandleWifiConfigure, .user_ctx = nullptr};
+  httpd_register_uri_handler(g_http_server, &wifi_cfg);
+
+  httpd_uri_t chat_status = {.uri = "/api/chat", .method = HTTP_GET, .handler = HandleChatStatus, .user_ctx = nullptr};
+  httpd_register_uri_handler(g_http_server, &chat_status);
+  httpd_uri_t chat_toggle = {.uri = "/api/chat/toggle", .method = HTTP_POST, .handler = HandleChatToggle, .user_ctx = nullptr};
+  httpd_register_uri_handler(g_http_server, &chat_toggle);
+
+  /* 全局 404 → 重定向到首页: 配合 DNS 劫持实现 captive portal,
+   * 手机连上 Dino-XXXX 后系统探测任何 URL 都会落到首页, 触发"登录网络"弹窗 */
+  httpd_register_err_handler(g_http_server, HTTPD_404_NOT_FOUND, [](httpd_req_t *req, httpd_err_code_t err) -> esp_err_t {
+      httpd_resp_set_status(req, "302 Found");
+      httpd_resp_set_hdr(req, "Location", "/");
+      httpd_resp_sendstr(req, "<html><body>redirecting...</body></html>");
+      return ESP_OK;
+  });
 
 #if ENABLE_AUTO_RUN
   httpd_uri_t action = {.uri = "/api/action", .method = HTTP_POST, .handler = HandleAction, .user_ctx = nullptr};

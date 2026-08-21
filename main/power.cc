@@ -2,6 +2,7 @@
 #include "config.h"
 #include "servo.h"
 #include "audio.h"
+#include "chat.h"
 
 #include <driver/gpio.h>
 #include <esp_adc/adc_cali.h>
@@ -44,6 +45,8 @@ static power_btn_state_t s_btn_state = BTN_IDLE;
 static uint32_t s_btn_state_since = 0;  // ms (esp_log_timestamp)
 static uint32_t s_btn_press_start = 0;  // ms
 static int s_btn_hold_tip = 0;          // last progress hint (500ms steps)
+static uint32_t s_last_click_ms = 0;    // ms of last short press release
+static int s_click_count = 0;           // consecutive short presses
 // Long-press shutdown is inert until the button has been released once after
 // boot — at power-on the button is necessarily held, and we must not fire then.
 static bool s_btn_armed = false;
@@ -68,20 +71,24 @@ static void ShutdownSequence()
 {
   ESP_LOGW(TAG, "⏻ Long press %dms — running shutdown sequence", POWER_LONG_PRESS_MS);
 
-  // 0. Power-off chime (synchronous, independent of Flash audio).
-  PlayShutdownTone();
-
-  // 1. Return every servo to a neutral 90° before de-powering.
+  // 0. Center ALL servos simultaneously, right now — the whole body returns to
+  //    a neutral pose the moment power-off begins. The servo rail stays powered
+  //    so the commands can actually take effect.
   for (int i = 0; i < kServoCount; ++i)
     SetServoAngle(i, 90);
+
+  // 1. Power-off chime plays while the servos physically move to centre.
+  PlayShutdownTone();
+
+  // 2. Let the servos finish reaching centre.
   vTaskDelay(pdMS_TO_TICKS(300));
 
-  // 2. Cut the servo power rail.
+  // 3. Cut the servo power rail.
   gpio_set_level(SERVO_POWER_GPIO, 0);
   ESP_LOGI(TAG, "Servo power IO%d LOW", SERVO_POWER_GPIO);
   vTaskDelay(pdMS_TO_TICKS(300));
 
-  // 3. Release the power latch — board powers down.
+  // 4. Release the power latch — board powers down.
   gpio_set_level(POWER_CTRL_GPIO, 0);
   ESP_LOGW(TAG, "POWER_CTRL IO%d LOW, system powering off", POWER_CTRL_GPIO);
 
@@ -186,8 +193,17 @@ void InitPower()
           } else if (now - s_btn_state_since >= POWER_DEBOUNCE_MS) {
             int dur = s_btn_press_start ? static_cast<int>(now - s_btn_press_start) : 0;
             ESP_LOGI(TAG, "🔘 Power button released (held %dms)", dur);
-            if (dur < POWER_LONG_PRESS_MS)
-              ESP_LOGI(TAG, "   Short press ignored (need %dms to shut down)", POWER_LONG_PRESS_MS);
+            if (dur < POWER_LONG_PRESS_MS) {
+              /* 短按 → 双击(400ms内)切换 AI 对话 */
+              if (now - s_last_click_ms <= 400) s_click_count++;
+              else s_click_count = 1;
+              s_last_click_ms = now;
+              if (s_click_count >= 2) {
+                s_click_count = 0;
+                ESP_LOGI(TAG, "DOUBLE CLICK -> toggle chat");
+                ChatToggle();
+              }
+            }
             s_btn_state = BTN_IDLE;
             s_btn_press_start = 0;
           }

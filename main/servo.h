@@ -9,6 +9,10 @@ enum ServoIndex {
     SERVO_TAIL_LR   = 4,   // IO18: tail left/right
 };
 
+// Reference-project alias so the chat/LLM module (copied verbatim from
+// tailRedPanda) keeps compiling: "SERVO_HEAD" = head turn (IO15).
+#define SERVO_HEAD SERVO_HEAD_TURN
+
 void InitServos();
 void SetServoAngle(int idx, int angle);
 

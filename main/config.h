@@ -6,6 +6,8 @@
 #define AUTO_RUN_DEFAULT_ON 1    // 1 = active on power-up, 0 = start paused
 #define AUTO_RUN_DEFAULT_HARD 0  // 1 = hard swing (instant to extrema + hold), 0 = sin² smooth
 #define HARD_SWING_SPEED_X 4.0f  // Hard-swing period multiplier (>1 = faster, 4x = continuous)
+#define CHAT_ENABLE 1            // 1 = compile LLM realtime chat (double-click power to toggle)
+#define AUDIO_SYNC_ENABLE 0      // 1 = 开机从 Audio Hub 同步音频到 Flash; 0 = 跳过(音频服务端未用, 不影响对话)
 
 // === Power management ===
 #define POWER_CTRL_GPIO GPIO_NUM_7   // Latch HIGH = power on, LOW = power off
@@ -67,7 +69,7 @@
 #define AUDIO_I2S_GPIO_DOUT GPIO_NUM_46
 #define AUDIO_I2S_GPIO_DIN GPIO_NUM_14
 #define AUDIO_SAMPLE_RATE 48000  // Opus source is 48kHz
-#define AUDIO_OUTPUT_VOLUME 50   // 0-100
+#define AUDIO_OUTPUT_VOLUME 80   // 0-100
 #define AUDIO_SILENT_INTERVAL_MIN_S 4
 #define AUDIO_SILENT_INTERVAL_MAX_S 6
 
@@ -80,8 +82,8 @@
 #define SPI_FLASH_MISO_PIN GPIO_NUM_21
 
 // === WiFi Station ===
-#define WIFI_STA_SSID     "huachuang109"
-#define WIFI_STA_PASSWORD "huachuang109"
+// #define WIFI_STA_SSID     "huachuang109"
+// #define WIFI_STA_PASSWORD "huachuang109"
 #define WIFI_STA_TIMEOUT_S 10   // Connection timeout (seconds), continue offline after
 
 // === Audio Sync Server ===
