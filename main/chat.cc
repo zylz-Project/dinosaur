@@ -33,8 +33,8 @@ static const char *TAG = "chat";
 
 /* ===================================================================
  *  配置
+ *  CHAT_WS_URL 等部署参数集中在 config.h（含 session_id 的来源注释）
  * =================================================================== */
-#define CHAT_WS_URL "wss://www.mmemoryy.xyz/api-proxy/api/v1/realtime/browser?session_id=141"
 
 #ifndef CHAT_ENABLE
 #define CHAT_ENABLE 1

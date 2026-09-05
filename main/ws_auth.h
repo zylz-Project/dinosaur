@@ -6,6 +6,7 @@
  * 正确流程:
  *   1. POST /auth/login {"username","password"} → Set-Cookie: mem_dialog_session=<v>
  *   2. WS 握手头: Cookie: mem_dialog_session=<v> + Origin: https://www.mmemoryy.xyz
+ * 登录地址与账号密码在 config.h（AUTH_API_URL/AUTH_USERNAME/AUTH_PASSWORD）。
  */
 
 #pragma once
@@ -14,16 +15,7 @@
 extern "C" {
 #endif
 
-/* 登录接口地址 / 账号配置 */
-#ifndef AUTH_API_URL
-#define AUTH_API_URL "https://www.mmemoryy.xyz/api-proxy/api/v1/auth/login"
-#endif
-#ifndef AUTH_USERNAME
-#define AUTH_USERNAME "admin"
-#endif
-#ifndef AUTH_PASSWORD
-#define AUTH_PASSWORD "admin123"
-#endif
+#include "config.h"   /* AUTH_API_URL / AUTH_USERNAME / AUTH_PASSWORD */
 
 #define WS_AUTH_COOKIE_MAX_LEN 256
 

@@ -95,7 +95,19 @@
 #define WIFI_STA_TIMEOUT_S 10   // Connection timeout (seconds), continue offline after
 
 // === Audio Sync Server ===
-#define SYNC_SERVER_IP    "192.168.1.7"    // User computer IP
+#define SYNC_SERVER_IP    "192.168.1.7"    // User computer IP（部署时改这里）
 #define SYNC_SERVER_PORT  5000
 #define SYNC_PRODUCT_ID   "dinosaur"       // Product ID for server routing
 #define SYNC_DOWNLOAD_BUF_SIZE 4096        // Download buffer size
+
+// === LLM Realtime Chat Server ===
+// 双击电源开关进入实时对话时连接的 WSS 入口。session_id 是服务端分配给
+// 本设备的会话标识（由后端下发，当前写死；换服务器/会话时改这里）。
+#define CHAT_WS_URL "wss://www.mmemoryy.xyz/api-proxy/api/v1/realtime/browser?session_id=141"
+
+// === 对话服务登录凭据（ws_auth.c 用它换会话 cookie） ===
+// ⚠️ 当前是演示用默认账号，且明文编译进固件（strings 即可读出）。
+// 上量前应改为设备侧 NVS 保存 + 配网页面下发，这里只留兜底。
+#define AUTH_API_URL  "https://www.mmemoryy.xyz/api-proxy/api/v1/auth/login"
+#define AUTH_USERNAME "admin"
+#define AUTH_PASSWORD "admin123"
