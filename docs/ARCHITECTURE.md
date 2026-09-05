@@ -417,7 +417,8 @@ chat.cc 里的对话调参（改前先看注释里的实测数据）：
 
 **加一个 Web 按钮** →
 1. `main/web_assets/panel.html` 加按钮和 fetch 调用（改网页不用动 C）；
-2. `http_server.cc` 加 handler + 路由（注意 max_uri_handlers=20 上限，当前 11+5）；
+2. `http_server.cc` 加 handler + 路由（注意 max_uri_handlers=20 上限，
+   当前 11 + flash 5 = 16）；
 3. handler 里调用对应模块的公共 API（`chat.h`/`auto_run.h`/`flash_audio.h`…）。
 
 **改配网页面** → `main/web_assets/` 下三个 html 分别是：面板、Flash 管理、
