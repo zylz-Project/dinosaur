@@ -5,6 +5,7 @@
 
 #include "sync_audio.h"
 #include "flash_audio.h"
+#include "audio.h"
 #include "config.h"
 
 #include <cJSON.h>
@@ -450,6 +451,20 @@ esp_err_t sync_audio_files(const char *api_token)
     }
 
     ESP_LOGI(TAG, "Download base URL: %s/api/device/v1/download/<n>", g_base_url);
+
+    // 同步会擦除/改写 TOC —— 正在播放时先把当前播放停掉并等它退出，
+    // 再动 flash（dino_play 任务这边会一直重试，不会卡死）
+    if (IsAudioPlaying()) {
+        ESP_LOGW(TAG, "Audio is playing; stopping it before writing flash");
+        AudioStopCurrent();
+        for (int i = 0; i < 100 && IsAudioPlaying(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));   // 最多等 1s
+        }
+        if (IsAudioPlaying()) {
+            ESP_LOGE(TAG, "Playback did not stop within 1s; abort sync");
+            return ESP_FAIL;
+        }
+    }
 
     // 4. Download new/changed files
     int downloaded = 0, skipped = 0, failed = 0;

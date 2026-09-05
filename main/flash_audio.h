@@ -1,3 +1,15 @@
+/*
+ * flash_audio.h — 外置 SPI Flash 上的音频文件系统（TOC 索引 + 数据区）
+ *
+ * 职责：管理 W25N01GV NAND 里存的所有 .opus 音频。第一个擦除块存 TOC
+ * （文件表：文件名/位置/大小/采样率/时长/分类），其余存文件数据。
+ * 读写都通过本文件的 API（TOC 常驻内存 g_files[]，改动后回写 flash）。
+ * 分类："animal"（叫声，配动作）与 "ambient"（环境音，待机随机播）。
+ * 注意：get_name/get_category 返回内部缓冲指针，只在 TOC 未被修改期间有效，
+ * 跨任务请用 flash_audio_get_file_info 拷贝。
+ * 被谁调用：audio.cc（播放时查文件）、auto_run.cc（按分类选音）、
+ * flash_upload_server.cc（网页上传/删除）、sync_audio.cc（在线同步）。
+ */
 #pragma once
 
 #include <cstdint>
@@ -94,10 +106,12 @@ esp_err_t flash_audio_read_file(int index, uint32_t offset, uint8_t *buf, size_t
  * @param  data       File data
  * @param  len        Data length
  * @param  sample_rate Audio sample rate (e.g. 48000)
+ * @param  category   "animal"（配动作的叫声，默认）或 "ambient"（环境音）
  * @return ESP_OK on success.
  */
 esp_err_t flash_audio_write_file(const char *filename, const uint8_t *data,
-                                  size_t len, uint32_t sample_rate);
+                                  size_t len, uint32_t sample_rate,
+                                  const char *category);
 
 /**
  * @brief  Delete a specific file from flash by name.
@@ -163,7 +177,9 @@ esp_err_t flash_audio_stream_end(flash_audio_stream_t *s);
 
 /**
  * @brief  Get display name pointer for a file by TOC index.
- *         Pointer is valid as long as TOC is loaded (lifetime of the process).
+ *         ⚠ 返回的是内部缓冲指针：在 TOC 被修改（上传/删除/擦除）之前有效。
+ *         立即使用（日志、strcmp）没问题；跨任务持有请改用
+ *         flash_audio_get_file_info() 拿整个条目的拷贝。
  * @param  index  File index (0-based)
  * @return Name string, "???" if index out of range or TOC not loaded.
  */
@@ -192,6 +208,7 @@ int flash_audio_get_random_in_category(const char *category);
 
 /**
  * @brief  Get the category string for a file by index.
+ *         ⚠ 同 get_name：返回内部指针，只在 TOC 未被修改前有效。
  * @param  index  File index (0-based)
  * @return Category string ("animal", "ambient"), or "???" if invalid.
  */

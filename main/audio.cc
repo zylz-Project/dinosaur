@@ -1,4 +1,13 @@
+/*
+ * audio.cc — 音频底层实现（ES8311 codec + I2S 双工 + Flash Opus 播放）
+ *
+ * 对外是 audio.h 的 API。dino_play 任务（prio 3, core 1）负责 Flash 音效
+ * 的取块→解封装→解码→I2S 输出；AudioWritePcm48k/AudioReadMic48k 是
+ * LLM 对话路径的读写口。所有写 codec 的路径都通过 audio_mutex_ 串行，
+ * GetAudioMotionData 提供音量包络供动作跟随。
+ */
 #include "audio.h"
+#include "audio_tone.h"
 #include "config.h"
 #include "flash_audio.h"
 #include "ogg_demuxer.h"
@@ -33,9 +42,13 @@ static QueueHandle_t sound_queue_ = nullptr;
 static SemaphoreHandle_t audio_mutex_ = nullptr;
 static volatile bool is_playing_ = false;
 static volatile bool stop_playback_ = false;   // set to interrupt current sound
-static volatile float motion_level_ = 0.0f;
-static volatile float motion_slow_level_ = 0.0f;
-static volatile float motion_attack_ = 0.0f;
+/* Flash 播放路径的音量包络（系数在 audio_tone.cc 注释，勿随意改动——动作手感调校值） */
+static const envelope_coef_t kMotionCoef = {
+    7200.0f, 0.28f, 0.28f, 0.06f, 1.0f, 3.2f, true};
+static envelope_t motion_env_ = {0, 0, 0};
+static volatile float motion_level_ = 0.0f;     // = motion_env_.fast（快包络）
+static volatile float motion_slow_level_ = 0.0f; // = motion_env_.slow（慢包络）
+static volatile float motion_attack_ = 0.0f;    // = envelope_update 返回的 onset
 static volatile uint32_t motion_elapsed_ms_ = 0;
 static volatile uint32_t motion_duration_ms_ = 0;
 static volatile int motion_sound_index_ = -1;
@@ -122,16 +135,10 @@ static void AudioPlayTask(void *arg) {
         float mean = chunk_n > 0
                          ? static_cast<float>(absolute_sum) / static_cast<float>(chunk_n)
                          : 0.0f;
-        float raw_level = mean / 7200.0f;
-        if (raw_level > 1.0f) raw_level = 1.0f;
-        float fast = motion_level_ * 0.72f + raw_level * 0.28f;
-        float slow = motion_slow_level_ * 0.94f + raw_level * 0.06f;
-        float onset = (fast - slow) * 3.2f;
-        if (onset < 0.0f) onset = 0.0f;
-        if (onset > 1.0f) onset = 1.0f;
-        motion_level_ = fast;
-        motion_slow_level_ = slow;
-        motion_attack_ = motion_attack_ * 0.58f + onset * 0.42f;
+        float onset = envelope_update(&motion_env_, mean, &kMotionCoef);
+        motion_level_ = motion_env_.fast;
+        motion_slow_level_ = motion_env_.slow;
+        motion_attack_ = onset;
         motion_elapsed_ms_ += static_cast<uint32_t>(chunk_n * 1000U / 48000U);
 
         if (stop_playback_) break;
@@ -147,6 +154,7 @@ static void AudioPlayTask(void *arg) {
     printf("I (%lu) %s: Playing #%d: %s (%lu bytes)\n",
            (unsigned long)esp_log_timestamp(), TAG,
            idx, info.name, (unsigned long)info.size);
+    envelope_reset(&motion_env_);
     motion_level_ = 0.0f;
     motion_slow_level_ = 0.0f;
     motion_attack_ = 0.0f;
@@ -172,6 +180,7 @@ static void AudioPlayTask(void *arg) {
     if (dec) esp_opus_dec_close(dec);
     heap_caps_free(pcm);
     is_playing_ = false;
+    envelope_reset(&motion_env_);
     motion_level_ = 0.0f;
     motion_slow_level_ = 0.0f;
     motion_attack_ = 0.0f;
@@ -249,26 +258,15 @@ bool PlayDinoSound(int t) {
 // Generates a short sine melody in-code and writes it straight to the codec.
 // This is deliberately independent of Flash audio so the shutdown chime always
 // plays, even after audio files have been unmounted or the TOC is gone.
+// 三种提示音共用 audio_tone 的合成核（正弦+淡入淡出，走 AudioWritePcm48k
+// 拿 audio_mutex_），各自只保留自己的频率序列与音量/包络参数。
 namespace {
-constexpr float kPi = 3.14159265f;
-constexpr int kToneAmplitude = 8000;   // gentle, well under 16-bit full scale
 
+// Boot/shutdown 双音（幅度 8000/32767≈0.244，5ms 淡入淡出，段间 10ms）
 void WriteTone(const int *freqs, const int *durs_ms, int count) {
-  if (!dev_) return;
-  const int sr = AUDIO_SAMPLE_RATE;
-  const int fade_n = sr * 5 / 1000;    // 5ms fade in/out to avoid clicks
+  const float vol = 8000.0f / 32767.0f;
   for (int k = 0; k < count; ++k) {
-    const int n = sr * durs_ms[k] / 1000;
-    std::vector<int16_t> buf(n);
-    for (int i = 0; i < n; ++i) {
-      const float t = static_cast<float>(i) / sr;
-      float fade = 1.0f;
-      if (i < fade_n) fade = static_cast<float>(i) / fade_n;
-      else if (i > n - fade_n) fade = static_cast<float>(n - i) / fade_n;
-      buf[i] = static_cast<int16_t>(kToneAmplitude * fade *
-                                    sinf(2.0f * kPi * freqs[k] * t));
-    }
-    esp_codec_dev_write(dev_, buf.data(), n * sizeof(int16_t));
+    tone_sine_write((float)freqs[k], durs_ms[k], vol, 5, 5);
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
@@ -283,7 +281,14 @@ void PlayBootTone() {
 
 void PlayShutdownTone() {
   // Falling two-note chirp — "powering off".
-  FlushAudioQueue();  // drop any queued Flash sound so the chime is clean
+  // 当前若有音效在播，先打断并等 dino_play 真正退出（有界 500ms），
+  // 否则 WriteTone 会被 audio_mutex_ 一直压着，关机音发不出来。
+  if (is_playing_) {
+    AudioStopCurrent();
+    for (int i = 0; i < 50 && is_playing_; ++i)
+      vTaskDelay(pdMS_TO_TICKS(10));
+    is_playing_ = false;  // 超时兜底：宁可抢播也别吞掉关机音
+  }
   const int freqs[] = {1320, 880};
   const int durs[] = {120, 200};
   WriteTone(freqs, durs, 2);
@@ -328,57 +333,20 @@ void AudioWritePcm48k(const int16_t *pcm, int samples) {
 }
 
 void AudioPlayChatReadyTone() {
-  static constexpr float kPi = 3.14159265358979323846f;
-  static constexpr int kSampleRate = 48000;
-  static constexpr int kChunkSamples = 240;
+  // Short ascending "ready" sound (幅度 8000, 每段 1/8 时长淡入淡出, 段间 20ms)
   const int tones[] = {880, 1100};
   const int durations_ms[] = {80, 120};
-  int16_t chunk[kChunkSamples];
-
-  // Short ascending "ready" sound.  Generate it in small blocks so the prompt
-  // needs no flash access or large allocation.
+  const float vol = 8000.0f / 32767.0f;
   for (int t = 0; t < 2; ++t) {
-    const int total = kSampleRate * durations_ms[t] / 1000;
-    const int fade = total / 8;
-    for (int pos = 0; pos < total; pos += kChunkSamples) {
-      int count = total - pos;
-      if (count > kChunkSamples) count = kChunkSamples;
-      for (int i = 0; i < count; ++i) {
-        const int sample = pos + i;
-        float gain = 1.0f;
-        if (sample < fade) gain = (float)sample / (float)fade;
-        else if (sample >= total - fade)
-          gain = (float)(total - sample - 1) / (float)fade;
-        chunk[i] = (int16_t)(sinf(2.0f * kPi * tones[t] * sample /
-                                  (float)kSampleRate) * 8000.0f * gain);
-      }
-      AudioWritePcm48k(chunk, count);
-    }
+    const int fade = durations_ms[t] / 8;
+    tone_sine_write((float)tones[t], durations_ms[t], vol, fade, fade);
     if (t == 0) vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
-// 合成提示音（不上 flash，直接生成正弦波 + 包络）
+// 合成提示音（不上 flash，直接生成正弦波 + 10ms 起音 / 40ms 收尾包络）
 static void ChimeTone(float freq, int dur_ms, float vol) {
-  const int sr = AUDIO_SAMPLE_RATE;
-  const int chunk = 240;
-  const int total = sr * dur_ms / 1000;
-  int16_t buf[chunk];
-  for (int pos = 0; pos < total; pos += chunk) {
-    int n = total - pos;
-    if (n > chunk) n = chunk;
-    for (int i = 0; i < n; i++) {
-      float pi = (float)(pos + i);
-      float t = pi / (float)sr;
-      float attack = pi < sr * 0.010f ? pi / (sr * 0.010f) : 1.0f;
-      float rb = (float)total - sr * 0.040f;
-      float release = pi > rb ? (1.0f - (pi - rb) / (sr * 0.040f)) : 1.0f;
-      if (release < 0.0f) release = 0.0f;
-      float v = vol * attack * release * std::sin(2.0f * (float)M_PI * freq * t);
-      buf[i] = (int16_t)(v * 32767.0f);
-    }
-    AudioWritePcm48k(buf, n);
-  }
+  tone_sine_write(freq, dur_ms, vol, 10, 40);
 }
 
 void AudioPlayChime(bool ascending) {

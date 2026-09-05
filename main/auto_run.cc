@@ -1,3 +1,11 @@
+/*
+ * auto_run.cc — 动作引擎：有机波形合成 + 待机状态机 + 音效语义匹配
+ *
+ * 动作关键帧数据表在 auto_run_data.cc（动作库本体，改动作只改那个文件）；
+ * 本文件负责：把 ClipSet 里的关键帧插值成 50Hz 舵机输出（organic_sin
+ * 相位扭曲+谐波，避免机械感）、待机状态机（IDLE/RELAX 轮换+随机音效）、
+ * 以及 Trigger* 动作调用 API 和"音效文件名→动作"的匹配规则。
+ */
 #include "auto_run.h"
 #include "audio.h"
 #include "config.h"
@@ -1992,8 +2000,13 @@ static BehaviorMode random_idle_behavior() {
 }
 
 static DinoAction action_for_sound(int sound_index) {
-    const char *name = flash_audio_get_name(sound_index);
-    int duration = flash_audio_get_duration_ms(sound_index);
+    /* 取文件条目快照（TOC 可能被并发上传/删除改写，get_name 返回的内部
+     * 指针不宜持有；整体拷贝一次再慢慢匹配最稳）。 */
+    flash_audio_info_t info{};
+    if (flash_audio_get_file_info(sound_index, &info) != ESP_OK)
+        return DINO_ACTION_PROUD_CALL;
+    const char *name = info.name;
+    int duration = (int)info.duration_ms;
 
     if (std::strstr(name, "咀嚼") || std::strstr(name, "eat") || std::strstr(name, "chew"))
         return DINO_ACTION_EAT;
@@ -2049,8 +2062,34 @@ bool TriggerDinoActionWithAutoSound(DinoAction action) {
     int candidates = 0;
     int total = flash_audio_get_file_count();
     for (int i = 0; i < total; ++i) {
-        if (std::strcmp(flash_audio_get_category(i), "animal") != 0) continue;
-        if (action_for_sound(i) != action) continue;
+        flash_audio_info_t info{};
+        if (flash_audio_get_file_info(i, &info) != ESP_OK) continue;
+        if (std::strcmp(info.category, "animal") != 0) continue;
+        // action_for_sound 内部会再取一次 info；这里只需按名称/时长初判，
+        // 直接内联判断避免双次拷贝。
+        // （保持与 action_for_sound 相同的匹配规则）
+        const char *name = info.name;
+        const int duration = (int)info.duration_ms;
+        DinoAction act;
+        if (std::strstr(name, "咀嚼") || std::strstr(name, "eat") || std::strstr(name, "chew"))
+            act = DINO_ACTION_EAT;
+        else if (std::strstr(name, "脚步") || std::strstr(name, "step") || std::strstr(name, "foot"))
+            act = DINO_ACTION_LISTEN;
+        else if (std::strstr(name, "入睡") || std::strstr(name, "sleep"))
+            act = DINO_ACTION_SLEEPY;
+        else if (std::strstr(name, "警觉") || std::strstr(name, "startle"))
+            act = DINO_ACTION_STARTLED;
+        else if (std::strstr(name, "雀跃") || std::strstr(name, "happy") || std::strstr(name, "joy"))
+            act = DINO_ACTION_HAPPY;
+        else if (std::strstr(name, "亲近") || std::strstr(name, "comfort") || std::strstr(name, "nuzzle"))
+            act = DINO_ACTION_AFFECTION;
+        else if (duration > 0 && duration <= 1500)
+            act = DINO_ACTION_DISCOVER;
+        else if (duration > 0 && duration <= 2700)
+            act = DINO_ACTION_HAPPY;
+        else
+            act = DINO_ACTION_PROUD_CALL;
+        if (act != action) continue;
         ++candidates;
         if (irnd(candidates) == 0) selected = i;
     }
@@ -2062,8 +2101,10 @@ bool TriggerDinoGreeting() {
     int candidates = 0;
     int total = flash_audio_get_file_count();
     for (int i = 0; i < total; ++i) {
-        const char *name = flash_audio_get_name(i);
-        int duration = flash_audio_get_duration_ms(i);
+        flash_audio_info_t info{};
+        if (flash_audio_get_file_info(i, &info) != ESP_OK) continue;
+        const char *name = info.name;
+        int duration = (int)info.duration_ms;
         bool is_call = std::strstr(name, "叫声") || std::strstr(name, "call") ||
                        std::strstr(name, "roar");
         if (is_call && duration > 0 && duration <= 5000) {

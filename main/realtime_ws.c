@@ -1,9 +1,10 @@
 /*
- * realtime_ws.c — WebSocket 实时音频 (使用 esp_websocket_client)
+ * realtime_ws.c — WebSocket 实时音频通道（连接层，见 realtime_ws.h 协议说明）
  *
- * 应用层负责：JSON 解析、TTS 累积、响应队列。
- * 使用独立的 TTS 音频队列避免播放期间 chunk 被覆盖。
- * TTS 音频完整接收后一次性解码，保证 WAV 采样对齐。
+ * 本文件负责连接生命周期：初始化 esp_websocket_client（带 cookie/Origin/
+ * 证书配置）、连接任务（先等时间同步→握手→发 hello）、断线重连、断开清理。
+ * JSON 解析与 TTS 流控在同 component 的实现文件里（parse/流控），
+ * 消息经 g_msg_queue 交给 proc_task 分发。
  */
 
 #include "realtime_ws.h"

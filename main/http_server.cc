@@ -1,9 +1,17 @@
+/*
+ * http_server.cc — Web 面板与本地 API 实现
+ *
+ * 路由：/ 控制面板页（内嵌 HTML）；/api/servo 舵机滑条、/api/action 动作、
+ * /api/autoplay 开关、/api/battery 电量、/api/wifi* 配网扫描/连接、
+ * /api/chat* 对话开关。404 全部 302 回首页（配合 DNS 劫持 captive portal）。
+ * 对话进行中拒绝动作/滑条请求（舵机归 chat_motion 管）。
+ * Flash 管理页与上传 API 在 flash_upload_server.cc。
+ */
 #include "http_server.h"
 #include "audio.h"
 #include "auto_run.h"
 #include "chat.h"
 #include "config.h"
-#include "dino_samples.h"
 #include "flash_audio.h"
 #include "flash_upload_server.h"
 #include "power.h"
@@ -14,6 +22,7 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <cJSON.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -324,6 +333,13 @@ static esp_err_t HandleRoot(httpd_req_t *req)
 
 static esp_err_t HandleServo(httpd_req_t *req)
 {
+  // 聊天进行中时 chat_motion 任务持有舵机（情绪驱动）——这里复活写舵机会打架
+  if (ChatIsActive()) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":false,\"reason\":\"chat_active\"}");
+    return ESP_OK;
+  }
+
   char buf[512] = {};
   int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
   if (ret <= 0) { httpd_resp_send_500(req); return ESP_FAIL; }
@@ -332,14 +348,14 @@ static esp_err_t HandleServo(httpd_req_t *req)
   int angles[5] = {SERVO_NECK_TILT_DEFAULT, SERVO_NECK_LEAN_DEFAULT,
                    SERVO_HEAD_TURN_DEFAULT, SERVO_TAIL_UD_DEFAULT,
                    SERVO_TAIL_LR_DEFAULT};
-  const char *p = strstr(buf, "\"angles\":");
-  if (p) {
-    p += 9;
-    for (int i = 0; i < 5; i++) {
-      while (*p == ' ' || *p == '[' || *p == ',') p++;
-      angles[i] = atoi(p);
-      while (*p && *p != ',' && *p != ']') p++;
+  cJSON *root = cJSON_Parse(buf);
+  if (root) {
+    const cJSON *arr = cJSON_GetObjectItem(root, "angles");
+    if (cJSON_IsArray(arr)) {
+      for (int i = 0; i < 5 && i < cJSON_GetArraySize(arr); i++)
+        angles[i] = cJSON_GetArrayItem(arr, i)->valueint;
     }
+    cJSON_Delete(root);
   }
   for (int i = 0; i < 5; i++)
     SetServoAngle(i, angles[i]);
@@ -362,6 +378,13 @@ static esp_err_t HandleBattery(httpd_req_t *req)
 #if ENABLE_AUTO_RUN
 static esp_err_t HandleAction(httpd_req_t *req)
 {
+    // 同 HandleServo：聊天中不允许手动触发动作，避免与 chat_motion 抢舵机
+    if (ChatIsActive()) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"reason\":\"chat_active\"}");
+        return ESP_OK;
+    }
+
     char buf[96] = {};
     int received = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (received <= 0) {
@@ -369,8 +392,12 @@ static esp_err_t HandleAction(httpd_req_t *req)
         return ESP_FAIL;
     }
     buf[received] = 0;
-    const char *p = strstr(buf, "\"action\":");
-    int action = p ? atoi(p + 9) : -1;
+    int action = -1;
+    cJSON *root = cJSON_Parse(buf);
+    if (root) {
+      action = cJSON_GetObjectItem(root, "action")->valueint;
+      cJSON_Delete(root);
+    }
     bool ok = action >= 0 && action < DINO_ACTION_COUNT;
     if (ok) {
         SetAutoRunRunning(true);
@@ -383,15 +410,25 @@ static esp_err_t HandleAction(httpd_req_t *req)
 
 static esp_err_t HandleAutoPlay(httpd_req_t *req)
 {
+    // POST 会复活 auto_run 任务（SetAutoRunRunning(true)）——聊天中拒绝；
+    // GET 只读状态，放行
+    if (req->method == HTTP_POST && ChatIsActive()) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"reason\":\"chat_active\",\"autoplay\":false}");
+        return ESP_OK;
+    }
     if (req->method == HTTP_POST) {
         char buf[64] = {};
         httpd_req_recv(req, buf, sizeof(buf) - 1);
-        const char *p = strstr(buf, "\"enable\":");
-        if (p) { p += 9; SetAutoRunRunning(atoi(p) != 0); }
-        else if (!strstr(buf, "hard_swing"))
-            SetAutoRunRunning(!IsAutoRunRunning());
-        p = strstr(buf, "\"hard_swing\":");
-        if (p) { p += 13; SetAutoRunHardSwing(strncmp(p, "true", 4) == 0 || atoi(p) == 1); }
+        cJSON *root = cJSON_Parse(buf);
+        if (root) {
+            const cJSON *enable = cJSON_GetObjectItem(root, "enable");
+            const cJSON *hard = cJSON_GetObjectItem(root, "hard_swing");
+            if (enable) SetAutoRunRunning(cJSON_IsTrue(enable));
+            else if (!hard) SetAutoRunRunning(!IsAutoRunRunning());
+            if (hard) SetAutoRunHardSwing(cJSON_IsTrue(hard));
+            cJSON_Delete(root);
+        }
     }
     char resp[96];
     snprintf(resp, sizeof(resp), "{\"autoplay\":%s,\"hard_swing\":%s}",
@@ -463,21 +500,17 @@ static esp_err_t HandleWifiConfigure(httpd_req_t *req)
     body[len] = 0;
 
     char ssid[33] = {}, pass[65] = {};
-    const char *ps = strstr(body, "\"ssid\"");
-    const char *pp = strstr(body, "\"password\"");
-    if (ps) {
-        ps = strchr(ps, ':'); ps = strchr(ps, '"');
-        const char *e = strchr(ps + 1, '"');
-        size_t n = (e && e > ps) ? (size_t)(e - ps - 1) : 0;
-        if (n >= sizeof(ssid)) n = sizeof(ssid) - 1;
-        memcpy(ssid, ps + 1, n);
-    }
-    if (pp) {
-        pp = strchr(pp, ':'); pp = strchr(pp, '"');
-        const char *e = strchr(pp + 1, '"');
-        size_t n = (e && e > pp) ? (size_t)(e - pp - 1) : 0;
-        if (n >= sizeof(pass)) n = sizeof(pass) - 1;
-        memcpy(pass, pp + 1, n);
+    cJSON *root = cJSON_Parse(body);
+    if (root) {
+        const cJSON *s = cJSON_GetObjectItem(root, "ssid");
+        const cJSON *p = cJSON_GetObjectItem(root, "password");
+        if (cJSON_IsString(s)) {
+            strncpy(ssid, s->valuestring, sizeof(ssid) - 1);
+        }
+        if (cJSON_IsString(p)) {
+            strncpy(pass, p->valuestring, sizeof(pass) - 1);
+        }
+        cJSON_Delete(root);
     }
     if (!ssid[0]) { httpd_resp_set_type(req, "text/plain"); httpd_resp_sendstr(req, "no ssid"); return ESP_OK; }
 
@@ -486,7 +519,6 @@ static esp_err_t HandleWifiConfigure(httpd_req_t *req)
     /* 先回响应, 让手机收到"已保存"再关热点, 避免页面加载中断乱跳 */
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_sendstr(req, "ok");
-    vTaskDelay(pdMS_TO_TICKS(800));
 
     WifiConfigStopPortal();  /* 保存后切回 STA 连接 */
     return ESP_OK;

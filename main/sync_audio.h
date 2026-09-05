@@ -1,3 +1,11 @@
+/*
+ * sync_audio.h — Audio Hub 音频同步客户端（服务端 → 本机 Flash）
+ *
+ * 职责：sync_audio_files(token) 拉取服务端音频清单，与本地 TOC 比对后
+ * 增量下载（流式直写 Flash，不占 RAM）、删除多余文件。由 main.cc 在
+ * 设备激活后以后台任务调用；WiFi 省电的开/关也收在这里（下载前关省电，
+ * 下载完恢复）。
+ */
 #pragma once
 
 #include <esp_err.h>

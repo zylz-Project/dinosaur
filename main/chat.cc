@@ -10,6 +10,7 @@
 
 #include "chat.h"
 #include "audio.h"
+#include "audio_tone.h"
 #include "config.h"
 #include "realtime_ws.h"
 #include "servo.h"
@@ -67,10 +68,12 @@ typedef enum {
     CHAT_PLAYING,   /* 播放 TTS，暂停发送防回声 */
 } chat_state_t;
 
-static chat_state_t g_state = CHAT_IDLE;
+/* g_state 跨任务读写契约：chat_response 是唯一写者，chat_feed / chat_motion
+ * 只读。volatile 保证读者不缓存旧值；读到"上一拍"的状态无害（本轮循环会
+ * 重读），因此不加锁——50Hz 实时路径锁的开销和优先级反转风险大于收益。 */
+static volatile chat_state_t g_state = CHAT_IDLE;
 static volatile bool g_chat_on = false;
 static volatile bool g_streaming = false;
-static volatile bool g_user_stopped = true;
 static volatile bool g_ready_prompt_pending = false;
 
 static int16_t *g_ws_frame_buf = nullptr; /* 640 samples */
@@ -94,7 +97,20 @@ typedef struct {
     float ud_bias;   /* 尾巴上下偏移 */
     bool  shake;     /* 是否摇头 */
 } emo_bias_t;
+/* g_emo_target 同样是"单写多读"：apply_emotion（chat_response 任务）写，
+ * chat_motion 任务读。chat_get_emo_snapshot() 是给跨任务读者的取值口。 */
 static emo_bias_t g_emo_target = {1.0f, 0, 0, 0, false};
+
+chat_emo_bias_t chat_get_emo_snapshot(void)
+{
+    chat_emo_bias_t out;
+    out.speed = g_emo_target.speed;
+    out.head_bias = g_emo_target.head_bias;
+    out.lr_bias = g_emo_target.lr_bias;
+    out.ud_bias = g_emo_target.ud_bias;
+    out.shake = g_emo_target.shake;
+    return out;
+}
 
 static void apply_emotion(const char *label)
 {
@@ -120,22 +136,20 @@ static void apply_emotion(const char *label)
 /* ===================================================================
  *  TTS 播放 + 包络
  * =================================================================== */
-static float fast_env_ = 0.0f;
-static float slow_env_ = 0.0f;
+/* 对话 TTS 路径的包络系数（与 audio.cc 的 Flash 路径不同：幅度基准 9000、
+ * 快包络上行快下行慢、无 attack 低通——这些是实机调校值，见 audio_tone.cc） */
+static const envelope_coef_t kChatCoef = {
+    9000.0f, 0.48f, 0.12f, 0.035f, 1.08f, 3.2f, false};
+static envelope_t chat_env_ = {0, 0, 0};
 
 static void chat_envelope(const int16_t *pcm, int n)
 {
     if (!pcm || n <= 0) return;
     uint32_t sum = 0;
     for (int i = 0; i < n; i++) sum += (uint32_t)std::abs((int)pcm[i]);
-    float raw = (float)sum / (float)n / 9000.0f;
-    if (raw > 1.0f) raw = 1.0f;
-    fast_env_ += (raw - fast_env_) * (raw > fast_env_ ? 0.48f : 0.12f);
-    slow_env_ += (raw - slow_env_) * 0.035f;
-    float onset = (fast_env_ - slow_env_ * 1.08f) * 3.2f;
-    if (onset < 0.0f) onset = 0.0f;
-    if (onset > 1.0f) onset = 1.0f;
-    g_chat_level = slow_env_;
+    float raw = (float)sum / (float)n;
+    float onset = envelope_update(&chat_env_, raw, &kChatCoef);
+    g_chat_level = chat_env_.slow;
     g_chat_attack = onset;
 }
 
@@ -579,12 +593,13 @@ static void chat_motion_task(void *arg)
         float attack = g_chat_attack;
         bool playing = g_chat_playing;
 
-        /* 情绪参数缓慢逼近目标 */
-        emo_head += (g_emo_target.head_bias - emo_head) * 0.02f;
-        emo_lr += (g_emo_target.lr_bias - emo_lr) * 0.02f;
-        emo_ud += (g_emo_target.ud_bias - emo_ud) * 0.02f;
-        emo_speed += (g_emo_target.speed - emo_speed) * 0.02f;
-        emo_shake = g_emo_target.shake;
+        /* 情绪参数缓慢逼近目标（快照读，见 g_emo_target 契约注释） */
+        const chat_emo_bias_t emo = chat_get_emo_snapshot();
+        emo_head += (emo.head_bias - emo_head) * 0.02f;
+        emo_lr += (emo.lr_bias - emo_lr) * 0.02f;
+        emo_ud += (emo.ud_bias - emo_ud) * 0.02f;
+        emo_speed += (emo.speed - emo_speed) * 0.02f;
+        emo_shake = emo.shake;
 
         /* 基础姿态: 情绪→抬颈/低头+轻微转头, 尾巴回中 */
         float t_neck = (float)SERVO_NECK_TILT_DEFAULT - emo_head;
@@ -696,16 +711,18 @@ bool ChatStart(void)
      * 批量收包，表现正是 TTS 突发到达、播放卡顿和控制消息延迟。 */
     WiFiPowerSave(false);
 
+    /* 先清缓冲再开闸（g_ws_frame_pos = 0 必须在 g_chat_on = true 之前）：
+     * chat_feed 看到 g_chat_on 立刻开始发帧，若开关在前、清零在后，
+     * 可能发出一帧残留的旧音频。 */
+    g_ws_frame_pos = 0;
     g_chat_on = true;
-    g_user_stopped = false;
     g_state = CHAT_IDLE;
     g_streaming = false;
     g_ready_prompt_pending = true;
-    g_ws_frame_pos = 0;
     g_chat_playing = false;
     g_chat_level = 0;
     g_chat_attack = 0;
-    fast_env_ = 0; slow_env_ = 0;
+    envelope_reset(&chat_env_);
 
     ESP_LOGI(TAG, "heap free=%lu bytes at chat start (internal=%lu, psram=%lu)",
              (unsigned long)esp_get_free_heap_size(),
@@ -724,7 +741,6 @@ void ChatStop(void)
     if (!g_chat_on) return;
     ESP_LOGI(TAG, ">>> Chat stop <<<");
     g_chat_on = false;
-    g_user_stopped = true;
     g_state = CHAT_IDLE;
     g_streaming = false;
     g_ready_prompt_pending = false;

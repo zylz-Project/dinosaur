@@ -1,3 +1,11 @@
+/*
+ * servo.h — 五路舵机 PWM 驱动（LEDC 50Hz，唯一写舵机寄存器的模块）
+ *
+ * 职责：InitServos 依次给舵机通电(IO4)、防浮空、配 PWM、回中位；
+ * SetServoAngle(idx, angle) 设置某一路角度（内部钳位，IO8 尾巴上下限 55°~180°）。
+ * 不负责：动作编排（auto_run.cc）、对话时的动作（chat.cc）——它们都只是
+ * 定期调用 SetServoAngle 的"写入者"。
+ */
 #pragma once
 
 // Servo index enum — each physical servo for the dinosaur
@@ -8,10 +16,6 @@ enum ServoIndex {
     SERVO_TAIL_UD   = 3,   // IO8:  tail up/down
     SERVO_TAIL_LR   = 4,   // IO18: tail left/right
 };
-
-// Reference-project alias so the chat/LLM module (copied verbatim from
-// tailRedPanda) keeps compiling: "SERVO_HEAD" = head turn (IO15).
-#define SERVO_HEAD SERVO_HEAD_TURN
 
 void InitServos();
 void SetServoAngle(int idx, int angle);

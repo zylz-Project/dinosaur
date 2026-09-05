@@ -1,3 +1,12 @@
+/*
+ * wifi.h — WiFi STA 连接管理（事件驱动 + 自动重连）
+ *
+ * 职责：InitWiFi 按"优先 NVS 已保存凭据"连 WiFi；断线自动重连，
+ * 连续失败(4 次/8 秒)转投配网热点(wifi_config)；连上后启动 SNTP 校时。
+ * 另提供：WaitForWiFi 阻塞等待、WiFiWaitForTimeSync（TLS 需要正确时钟）、
+ * WiFiPowerSave 开关省电、WiFiIP/状态查询。
+ * 配网热点 SoftAP/DNS/网页本身在 wifi_config.cc，不在这里。
+ */
 #pragma once
 
 #include <stdbool.h>

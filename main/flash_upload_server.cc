@@ -1,5 +1,9 @@
+/*
+ * flash_upload_server.cc — Flash 音频管理页/上传/擦除 API 实现（见 flash_upload_server.h）
+ */
 #include "flash_upload_server.h"
 #include "flash_audio.h"
+#include "audio.h"
 
 #include <esp_http_server.h>
 #include <esp_log.h>
@@ -225,6 +229,14 @@ static esp_err_t HandleFlashStatus(httpd_req_t *req) {
 }
 
 static esp_err_t HandleFlashUpload(httpd_req_t *req) {
+    // 写 flash 会擦除/改写 TOC —— 播放中操作会让读音端读到半新半旧的表，先拒绝
+    if (IsAudioPlaying()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        httpd_resp_sendstr(req, "正在播放音频，请先停止后再上传");
+        return ESP_FAIL;
+    }
+
     char content_type[64] = {};
     if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type,
                                       sizeof(content_type)) != ESP_OK) {
@@ -310,7 +322,7 @@ static esp_err_t HandleFlashUpload(httpd_req_t *req) {
 
     // Write to SPI Flash
     esp_err_t err = flash_audio_write_file(filename, (const uint8_t *)data_start,
-                                            data_len, 48000);
+                                            data_len, 48000, "animal");
 
     if (err == ESP_OK) {
         httpd_resp_set_type(req, "text/plain");
@@ -325,6 +337,14 @@ static esp_err_t HandleFlashUpload(httpd_req_t *req) {
 }
 
 static esp_err_t HandleFlashErase(httpd_req_t *req) {
+    // 擦除会清掉所有音频数据 —— 播放中擦除会让解码端读空，先拒绝
+    if (IsAudioPlaying()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        httpd_resp_sendstr(req, "正在播放音频，请先停止后再擦除");
+        return ESP_FAIL;
+    }
+
     esp_err_t ret = flash_audio_erase_all();
     if (ret == ESP_OK) {
         httpd_resp_sendstr(req, "OK");

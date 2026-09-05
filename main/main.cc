@@ -3,7 +3,6 @@
 #include "auto_run.h"
 #include "chat.h"
 #include "device_registry.h"
-#include "dino_samples.h"
 #include "flash_audio.h"
 #include "http_server.h"
 #include "power.h"

@@ -1,3 +1,6 @@
+/*
+ * power.cc — 电源按键状态机 + 电池采样 + 开关机提示音（见 power.h）
+ */
 #include "power.h"
 #include "config.h"
 #include "servo.h"

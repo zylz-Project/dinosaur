@@ -31,6 +31,17 @@ bool ChatIsActive(void);
 /** WS 是否已连接且服务端 ready（供网页状态展示）。 */
 bool ChatIsReady(void);
 
+/** 情绪驱动参数快照（chat_motion 任务按此驱动舵机；单写多读，免锁）。 */
+typedef struct {
+    float speed;     /* 尾巴摆动速度倍率 */
+    float head_bias; /* 头部角度偏移（正=抬/偏） */
+    float lr_bias;   /* 尾巴左右偏移 */
+    float ud_bias;   /* 尾巴上下偏移 */
+    bool  shake;     /* 是否摇头 */
+} chat_emo_bias_t;
+
+chat_emo_bias_t chat_get_emo_snapshot(void);
+
 #ifdef __cplusplus
 }
 #endif

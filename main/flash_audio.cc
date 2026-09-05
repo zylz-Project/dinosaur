@@ -1,3 +1,9 @@
+/*
+ * flash_audio.cc — Flash 音频文件系统实现（TOC 表 + 数据区，见 flash_audio.h）
+ *
+ * TOC 常驻内存（g_files[]），任何改动最后回写 flash 的 sector 0；
+ * 数据区按擦除块对齐追加，删除只挪 TOC 条目不擦数据（留洞，安全快速）。
+ */
 #include "flash_audio.h"
 #include "external_flash.h"
 
@@ -6,12 +12,35 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 
 static const char *TAG = "flash_audio";
 
 static flash_audio_info_t g_files[FLASH_AUDIO_MAX_FILES];
 static int g_file_count = 0;
 static bool g_initialized = false;
+
+/* ===================================================================
+ *  TOC 互斥锁（并发契约，见 flash_audio.h 头注释）
+ *
+ *  谁在同时碰 TOC：dino_play（播放时查表+读数据）、audio_sync 后台任务
+ *  （下载写/删除）、flash_upload_server（网页上传/擦除）、auto_run（选音）。
+ *  用递归锁是因为 write_file/stream_* 内部会调 find_file 等函数。
+ *
+ *  读快照语义：flash_audio_read_file 在锁内把 index 换算成绝对 flash
+ *  地址，然后放锁再做慢速 SPI 读——即使此后 TOC 被改（删除使条目前移），
+ *  正在进行的读取仍指向原来那块数据，不会 crash。
+ * =================================================================== */
+static SemaphoreHandle_t s_toc_mutex = nullptr;
+
+static inline void toc_lock(void)
+{
+    if (s_toc_mutex) xSemaphoreTakeRecursive(s_toc_mutex, portMAX_DELAY);
+}
+static inline void toc_unlock(void)
+{
+    if (s_toc_mutex) xSemaphoreGiveRecursive(s_toc_mutex);
+}
 
 /* ==========================================================================
    Internal helpers
@@ -123,6 +152,8 @@ esp_err_t flash_audio_init(void)
     if (g_initialized)
         return ESP_OK;
 
+    if (!s_toc_mutex) s_toc_mutex = xSemaphoreCreateRecursiveMutex();
+
     // Initialize SPI Flash hardware
     esp_err_t ret = external_flash_init();
     if (ret != ESP_OK) {
@@ -178,61 +209,89 @@ esp_err_t flash_audio_init(void)
 
 int flash_audio_get_file_count(void)
 {
-    return g_file_count;
+    toc_lock();
+    int n = g_file_count;
+    toc_unlock();
+    return n;
 }
 
 esp_err_t flash_audio_get_file_info(int index, flash_audio_info_t *info)
 {
+    toc_lock();
+    esp_err_t err = ESP_OK;
     if (!info || index < 0 || index >= g_file_count)
-        return ESP_ERR_NOT_FOUND;
-    memcpy(info, &g_files[index], sizeof(flash_audio_info_t));
-    return ESP_OK;
+        err = ESP_ERR_NOT_FOUND;
+    else
+        memcpy(info, &g_files[index], sizeof(flash_audio_info_t));  /* 锁内整体拷贝=快照 */
+    toc_unlock();
+    return err;
 }
 
 const char *flash_audio_get_name(int index)
 {
-    if (index < 0 || index >= g_file_count)
-        return "???";
-    return g_files[index].name;
+    toc_lock();
+    const char *p = (index < 0 || index >= g_file_count) ? "???" : g_files[index].name;
+    toc_unlock();
+    return p;
 }
 
 int flash_audio_find_file(const char *filename)
 {
-    for (int i = 0; i < g_file_count; i++) {
-        if (strcmp(g_files[i].name, filename) == 0)
-            return i;
+    toc_lock();
+    int found = -1;
+    if (filename) {
+        for (int i = 0; i < g_file_count; i++) {
+            if (strcmp(g_files[i].name, filename) == 0) { found = i; break; }
+        }
     }
-    return -1;
+    toc_unlock();
+    return found;
 }
 
 int flash_audio_get_duration_ms(int index)
 {
-    if (index < 0 || index >= g_file_count)
-        return 0;
-    return (int)g_files[index].duration_ms;
+    toc_lock();
+    int ms = (index < 0 || index >= g_file_count) ? 0 : (int)g_files[index].duration_ms;
+    toc_unlock();
+    return ms;
 }
 
 esp_err_t flash_audio_read_file(int index, uint32_t offset, uint8_t *buf, size_t len)
 {
-    if (index < 0 || index >= g_file_count)
-        return ESP_ERR_NOT_FOUND;
-    if (offset + len > g_files[index].size)
-        return ESP_ERR_INVALID_ARG;
-
-    uint32_t flash_addr = FLASH_AUDIO_DATA_START + g_files[index].offset + offset;
+    /* 快照：锁内把 index 换算成绝对地址并做边界检查，锁外做慢速 SPI 读。
+     * 这样即使读期间 TOC 被删除/重排，本次读仍指向原数据（或已擦的 0xFF，
+     * 上层解码失败自然结束），不会 crash。 */
+    toc_lock();
+    esp_err_t err = ESP_OK;
+    uint32_t flash_addr = 0;
+    if (index < 0 || index >= g_file_count) {
+        err = ESP_ERR_NOT_FOUND;
+    } else if (offset + len > g_files[index].size) {
+        err = ESP_ERR_INVALID_ARG;
+    } else {
+        flash_addr = FLASH_AUDIO_DATA_START + g_files[index].offset + offset;
+    }
+    toc_unlock();
+    if (err != ESP_OK) return err;
     return external_flash_read(flash_addr, buf, len);
 }
 
 esp_err_t flash_audio_write_file(const char *filename, const uint8_t *data,
-                                  size_t len, uint32_t sample_rate)
+                                  size_t len, uint32_t sample_rate,
+                                  const char *category)
 {
     if (!filename || !data || len == 0)
         return ESP_ERR_INVALID_ARG;
-    if (g_file_count >= FLASH_AUDIO_MAX_FILES)
-        return ESP_ERR_NO_MEM;
+
+    /* 锁内查表并确定落盘位置（数据区分配），锁外擦写（慢操作不持锁）。 */
+    toc_lock();
+    if (g_file_count >= FLASH_AUDIO_MAX_FILES) { toc_unlock(); return ESP_ERR_NO_MEM; }
 
     // Check if file already exists
-    int existing = flash_audio_find_file(filename);
+    int existing = -1;
+    for (int i = 0; i < g_file_count; i++) {
+        if (strcmp(g_files[i].name, filename) == 0) { existing = i; break; }
+    }
     int index = existing >= 0 ? existing : g_file_count;
 
     // Calculate offset: after last file, aligned to sector
@@ -252,6 +311,7 @@ esp_err_t flash_audio_write_file(const char *filename, const uint8_t *data,
         }
         // else first file, offset = 0
     }
+    toc_unlock();
 
     // Erase sectors needed (with yield to keep WiFi alive)
     uint32_t start_sector = (FLASH_AUDIO_DATA_START + offset) / EXTERNAL_FLASH_ERASE_SIZE;
@@ -274,6 +334,7 @@ esp_err_t flash_audio_write_file(const char *filename, const uint8_t *data,
     }
 
     // Update TOC entry — strip .opus extension for display name consistency
+    toc_lock();
     {
         char clean_name[FLASH_AUDIO_FILENAME_MAX];
         strncpy(clean_name, filename, FLASH_AUDIO_FILENAME_MAX - 1);
@@ -283,19 +344,25 @@ esp_err_t flash_audio_write_file(const char *filename, const uint8_t *data,
         if (nlen > 5 && strcmp(clean_name + nlen - 5, ".opus") == 0)
             clean_name[nlen - 5] = '\0';
         strncpy(g_files[index].name, clean_name, FLASH_AUDIO_FILENAME_MAX - 1);
+        g_files[index].name[FLASH_AUDIO_FILENAME_MAX - 1] = '\0';
     }
-    g_files[index].name[FLASH_AUDIO_FILENAME_MAX - 1] = '\0';
     g_files[index].offset = offset;
     g_files[index].size = len;
     g_files[index].sample_rate = sample_rate;
     g_files[index].duration_ms = (uint32_t)(len * 1000ULL / 6000);  // est. ~48kbps
+    strncpy(g_files[index].category, (category && category[0]) ? category : "animal",
+            FLASH_AUDIO_CATEGORY_MAX - 1);
+    g_files[index].category[FLASH_AUDIO_CATEGORY_MAX - 1] = '\0';
 
     if (existing < 0)
         g_file_count++;
 
-    ESP_LOGI(TAG, "File written: %s (%zu bytes @ offset 0x%06lX)", filename, len, (unsigned long)offset);
+    ESP_LOGI(TAG, "File written: %s [%s] (%zu bytes @ offset 0x%06lX)",
+             filename, g_files[index].category, len, (unsigned long)offset);
 
-    return toc_flush();
+    ret = toc_flush();
+    toc_unlock();
+    return ret;
 }
 
 /* ==========================================================================
@@ -319,8 +386,13 @@ esp_err_t flash_audio_stream_begin(flash_audio_stream_t *s, const char *filename
     if (nlen > 5 && strcmp(s->name + nlen - 5, ".opus") == 0)
         s->name[nlen - 5] = '\0';
 
+    // 锁内查表分配位置，锁外擦除（擦除慢，不持锁）
+    toc_lock();
     // Check if replacing existing file
-    s->existing_idx = flash_audio_find_file(s->name);
+    s->existing_idx = -1;
+    for (int i = 0; i < g_file_count; i++) {
+        if (strcmp(g_files[i].name, s->name) == 0) { s->existing_idx = i; break; }
+    }
     if (s->existing_idx >= 0) {
         s->data_offset = g_files[s->existing_idx].offset;
     } else {
@@ -332,8 +404,8 @@ esp_err_t flash_audio_stream_begin(flash_audio_stream_t *s, const char *filename
                 s->data_offset = ((s->data_offset / EXTERNAL_FLASH_ERASE_SIZE) + 1) * EXTERNAL_FLASH_ERASE_SIZE;
         }
     }
-
     s->flash_addr = FLASH_AUDIO_DATA_START + s->data_offset;
+    toc_unlock();
 
     uint32_t start_sec = s->flash_addr / EXTERNAL_FLASH_ERASE_SIZE;
     uint32_t end_sec = (s->flash_addr + total_size + EXTERNAL_FLASH_ERASE_SIZE - 1) / EXTERNAL_FLASH_ERASE_SIZE;
@@ -433,9 +505,10 @@ esp_err_t flash_audio_stream_end(flash_audio_stream_t *s)
     s->pending_buf = nullptr;
 
     // Update TOC entry
+    toc_lock();
     int idx = s->existing_idx;
     if (idx < 0) {
-        if (g_file_count >= FLASH_AUDIO_MAX_FILES) return ESP_ERR_NO_MEM;
+        if (g_file_count >= FLASH_AUDIO_MAX_FILES) { toc_unlock(); return ESP_ERR_NO_MEM; }
         idx = g_file_count;
         g_file_count++;
     }
@@ -447,19 +520,27 @@ esp_err_t flash_audio_stream_end(flash_audio_stream_t *s)
     g_files[idx].sample_rate = 48000;
     g_files[idx].duration_ms = (uint32_t)(s->total_size * 1000ULL / 6000);
     strncpy(g_files[idx].category, s->category, FLASH_AUDIO_CATEGORY_MAX - 1);
+    g_files[idx].category[FLASH_AUDIO_CATEGORY_MAX - 1] = '\0';
 
     ESP_LOGI(TAG, "Stream end OK: %s [%s] (%lu KB, %d files total)",
              s->name, g_files[idx].category, (unsigned long)(s->total_size/1024), g_file_count);
-    return toc_flush();
+    esp_err_t err = toc_flush();
+    toc_unlock();
+    return err;
 }
 
 esp_err_t flash_audio_delete_file(const char *filename)
 {
     if (!filename) return ESP_ERR_INVALID_ARG;
 
-    int idx = flash_audio_find_file(filename);
+    toc_lock();
+    int idx = -1;
+    for (int i = 0; i < g_file_count; i++) {
+        if (strcmp(g_files[i].name, filename) == 0) { idx = i; break; }
+    }
     if (idx < 0) {
         ESP_LOGW(TAG, "Delete failed: '%s' not found", filename);
+        toc_unlock();
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -483,18 +564,27 @@ esp_err_t flash_audio_delete_file(const char *filename)
     }
     g_file_count--;
 
-    return toc_flush();
+    esp_err_t err = toc_flush();
+    toc_unlock();
+    return err;
 }
 
 esp_err_t flash_audio_erase_all(void)
 {
     ESP_LOGI(TAG, "Erasing all audio data...");
 
+    /* 快照当前文件表（锁内拷贝），锁外慢慢擦；擦完锁内清表回写 TOC。 */
+    flash_audio_info_t snapshot[FLASH_AUDIO_MAX_FILES];
+    toc_lock();
+    int snap_count = g_file_count;
+    memcpy(snapshot, g_files, sizeof(flash_audio_info_t) * snap_count);
+    toc_unlock();
+
     // Count total sectors
     uint32_t total_sec = 1;  // TOC
-    for (int i = 0; i < g_file_count; i++) {
-        uint32_t start = FLASH_AUDIO_DATA_START + g_files[i].offset;
-        uint32_t end = start + g_files[i].size;
+    for (int i = 0; i < snap_count; i++) {
+        uint32_t start = FLASH_AUDIO_DATA_START + snapshot[i].offset;
+        uint32_t end = start + snapshot[i].size;
         total_sec += (end + EXTERNAL_FLASH_ERASE_SIZE - 1) / EXTERNAL_FLASH_ERASE_SIZE
                      - start / EXTERNAL_FLASH_ERASE_SIZE;
     }
@@ -505,9 +595,9 @@ esp_err_t flash_audio_erase_all(void)
     int last_pct = 0;
 
     // Erase data sectors
-    for (int i = 0; i < g_file_count; i++) {
-        uint32_t start = FLASH_AUDIO_DATA_START + g_files[i].offset;
-        uint32_t end = start + g_files[i].size;
+    for (int i = 0; i < snap_count; i++) {
+        uint32_t start = FLASH_AUDIO_DATA_START + snapshot[i].offset;
+        uint32_t end = start + snapshot[i].size;
         uint32_t sec_start = start / EXTERNAL_FLASH_ERASE_SIZE;
         uint32_t sec_end = (end + EXTERNAL_FLASH_ERASE_SIZE - 1) / EXTERNAL_FLASH_ERASE_SIZE;
         for (uint32_t sec = sec_start; sec < sec_end; sec++) {
@@ -524,9 +614,12 @@ esp_err_t flash_audio_erase_all(void)
     }
 
     ESP_LOGI(TAG, "Erase all: 100%% (%lu sectors)", (unsigned long)total_sec);
+    toc_lock();
     g_file_count = 0;
     memset(g_files, 0, sizeof(g_files));
-    return toc_flush();
+    esp_err_t err = toc_flush();
+    toc_unlock();
+    return err;
 }
 
 esp_err_t flash_audio_write_toc(const uint8_t *toc_data, size_t toc_len)
@@ -547,8 +640,10 @@ esp_err_t flash_audio_write_toc(const uint8_t *toc_data, size_t toc_len)
         return ret;
 
     // Reload TOC
+    toc_lock();
     toc_deserialize(buf, sizeof(buf));
     ESP_LOGI(TAG, "TOC written from external source: %d files", g_file_count);
+    toc_unlock();
     return ESP_OK;
 }
 
@@ -564,10 +659,12 @@ esp_err_t flash_audio_read_toc(uint8_t *buf, size_t buf_sz)
 int flash_audio_get_count_by_category(const char *category)
 {
     if (!category) return 0;
+    toc_lock();
     int count = 0;
     for (int i = 0; i < g_file_count; i++) {
         if (strcmp(g_files[i].category, category) == 0) count++;
     }
+    toc_unlock();
     return count;
 }
 
@@ -575,18 +672,22 @@ int flash_audio_get_random_in_category(const char *category)
 {
     if (!category) return -1;
     // Collect matching indices
+    toc_lock();
     int matches[FLASH_AUDIO_MAX_FILES];
     int n = 0;
     for (int i = 0; i < g_file_count; i++) {
         if (strcmp(g_files[i].category, category) == 0)
             matches[n++] = i;
     }
-    if (n == 0) return -1;
-    return matches[rand() % n];
+    int pick = (n == 0) ? -1 : matches[rand() % n];
+    toc_unlock();
+    return pick;
 }
 
 const char *flash_audio_get_category(int index)
 {
-    if (index < 0 || index >= g_file_count) return "???";
-    return g_files[index].category;
+    toc_lock();
+    const char *p = (index < 0 || index >= g_file_count) ? "???" : g_files[index].category;
+    toc_unlock();
+    return p;
 }

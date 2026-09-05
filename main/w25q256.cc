@@ -40,6 +40,22 @@ static const char *TAG = "w25q256";
 static spi_device_handle_t g_spi_dev = NULL;
 static bool g_initialized = false;
 static uint32_t g_capacity_mbit = 0;   // 从 JEDEC ID 查表得到
+/* 总线互斥锁（与 w25n01gv.c 的 g_mutex 同一套约定）：多条公共入口都可能
+ * 并发（诊断/读写/擦除来自不同任务），每条公共入口取放锁，锁内完成
+ * 一次完整的 CS-low 事务。递归锁——公共入口内部再调公共入口不死锁。 */
+static SemaphoreHandle_t g_mutex = NULL;
+
+static bool driver_lock(void)
+{
+    return g_mutex && xSemaphoreTakeRecursive(g_mutex, portMAX_DELAY) == pdTRUE;
+}
+
+static void driver_unlock(void)
+{
+    xSemaphoreGiveRecursive(g_mutex);
+}
+
+static bool w25q_wait_busy_locked(uint32_t timeout_ms);
 
 /* --------------------------------------------------------------------------
    Winbond 容量查表 (JEDEC 第3字节 → Mbit)
@@ -160,6 +176,11 @@ esp_err_t w25q256_init(void)
 {
     if (g_initialized) return ESP_OK;
 
+    if (!g_mutex) {
+        g_mutex = xSemaphoreCreateRecursiveMutex();
+        if (!g_mutex) return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGI(TAG, "初始化 SPI Flash (Winbond W25Q 系列)...");
     ESP_LOGI(TAG, "  CLK  → IO%d", W25Q_CLK_PIN);
     ESP_LOGI(TAG, "  MOSI → IO%d (DI)", W25Q_MOSI_PIN);
@@ -235,8 +256,8 @@ esp_err_t w25q256_init(void)
         ESP_LOGW(TAG, "非 Winbond 厂商 (0xEF), 但继续尝试使用");
     }
 
-    // 等待 Flash 空闲
-    if (!w25q256_wait_busy(1000)) {
+    // 等待 Flash 空闲（此时锁尚未被公共入口拿走，直接用内部版）
+    if (!w25q_wait_busy_locked(1000)) {
         ESP_LOGW(TAG, "Flash 上电后未就绪, 继续尝试");
     }
 
@@ -248,6 +269,7 @@ esp_err_t w25q256_init(void)
 void w25q256_deinit(void)
 {
     if (!g_initialized) return;
+    if (!driver_lock()) return;
     w25q_cs_high();
     if (g_spi_dev) {
         spi_bus_remove_device(g_spi_dev);
@@ -255,6 +277,9 @@ void w25q256_deinit(void)
     }
     spi_bus_free(W25Q_SPI_HOST);
     g_initialized = false;
+    driver_unlock();
+    vSemaphoreDelete(g_mutex);
+    g_mutex = NULL;
     ESP_LOGI(TAG, "W25Q256 已释放");
 }
 
@@ -262,7 +287,7 @@ esp_err_t w25q256_read_jedec_id(uint8_t *manufacturer_id,
                                 uint8_t *memory_type,
                                 uint8_t *capacity)
 {
-    if (!g_spi_dev) return ESP_FAIL;
+    if (!g_spi_dev || !driver_lock()) return ESP_FAIL;
 
     // 发 4 字节: 0x9F + 3 dummy, 收 4 字节: dummy + MF + Type + Cap
     uint8_t tx[4] = {W25Q_CMD_READ_JEDEC_ID, 0x00, 0x00, 0x00};
@@ -279,6 +304,7 @@ esp_err_t w25q256_read_jedec_id(uint8_t *manufacturer_id,
     w25q_cs_low();
     esp_err_t ret = spi_device_polling_transmit(g_spi_dev, &t);
     w25q_cs_high();
+    driver_unlock();
 
     if (ret == ESP_OK) {
         // rx[0]=dummy(命令发出时收到,丢弃), rx[1]=MF, rx[2]=Type, rx[3]=Cap
@@ -291,7 +317,7 @@ esp_err_t w25q256_read_jedec_id(uint8_t *manufacturer_id,
 
 esp_err_t w25q256_read_unique_id(uint8_t uid[8])
 {
-    if (!g_spi_dev) return ESP_FAIL;
+    if (!g_spi_dev || !driver_lock()) return ESP_FAIL;
 
     // Send: CMD + 4 dummy bytes, then read 8 bytes UID
     // Total: 8 + 32 + 64 = 104 bits
@@ -314,6 +340,7 @@ esp_err_t w25q256_read_unique_id(uint8_t uid[8])
     w25q_cs_low();
     esp_err_t ret = spi_device_polling_transmit(g_spi_dev, &t);
     w25q_cs_high();
+    driver_unlock();
 
     if (ret == ESP_OK) {
         memcpy(uid, rx, 8);
@@ -321,7 +348,10 @@ esp_err_t w25q256_read_unique_id(uint8_t uid[8])
     return ret;
 }
 
-bool w25q256_wait_busy(uint32_t timeout_ms)
+/* 轮询 BUSY 位直到空闲。⚠ 内部辅助，调用者必须已持有 g_mutex——
+ * 写/擦除路径在等 BUSY 期间不能放锁，否则别的任务可能趁机发命令
+ * 撞上芯片忙态。公共的 w25q256_wait_busy 负责取锁。 */
+static bool w25q_wait_busy_locked(uint32_t timeout_ms)
 {
     if (!g_spi_dev) return false;
 
@@ -342,15 +372,23 @@ bool w25q256_wait_busy(uint32_t timeout_ms)
     return false;
 }
 
+bool w25q256_wait_busy(uint32_t timeout_ms)
+{
+    if (!driver_lock()) return false;
+    bool ok = w25q_wait_busy_locked(timeout_ms);
+    driver_unlock();
+    return ok;
+}
+
 esp_err_t w25q256_read(uint32_t addr, uint8_t *buf, size_t len)
 {
-    if (!g_spi_dev) return ESP_FAIL;
-    if (addr + len > W25Q256_TOTAL_SIZE) return ESP_ERR_INVALID_ARG;
-    if (len == 0) return ESP_OK;
+    if (!g_spi_dev || !driver_lock()) return ESP_FAIL;
+    if (addr + len > W25Q256_TOTAL_SIZE) { driver_unlock(); return ESP_ERR_INVALID_ARG; }
+    if (len == 0) { driver_unlock(); return ESP_OK; }
 
     // The address limits are already checked; ESP_ERR_INVALID_ARG is returned for overflow
     // This macro satisfies the unsigned comparison warning
-    if (len == 0) return ESP_OK;
+    if (len == 0) { driver_unlock(); return ESP_OK; }
 
     esp_err_t ret = ESP_OK;
 
@@ -360,6 +398,7 @@ esp_err_t w25q256_read(uint32_t addr, uint8_t *buf, size_t len)
     ret = w25q_send_cmd_addr(W25Q_CMD_READ_DATA, addr);
     if (ret != ESP_OK) {
         w25q_cs_high();
+        driver_unlock();
         return ret;
     }
 
@@ -381,14 +420,15 @@ esp_err_t w25q256_read(uint32_t addr, uint8_t *buf, size_t len)
     }
 
     w25q_cs_high();
+    driver_unlock();
     return ret;
 }
 
 esp_err_t w25q256_write(uint32_t addr, const uint8_t *buf, size_t len)
 {
-    if (!g_spi_dev) return ESP_FAIL;
-    if (addr + len > W25Q256_TOTAL_SIZE) return ESP_ERR_INVALID_ARG;
-    if (len == 0) return ESP_OK;
+    if (!g_spi_dev || !driver_lock()) return ESP_FAIL;
+    if (addr + len > W25Q256_TOTAL_SIZE) { driver_unlock(); return ESP_ERR_INVALID_ARG; }
+    if (len == 0) { driver_unlock(); return ESP_OK; }
 
     esp_err_t ret = ESP_OK;
     size_t offset = 0;
@@ -403,7 +443,7 @@ esp_err_t w25q256_write(uint32_t addr, const uint8_t *buf, size_t len)
         w25q_cs_low();
         ret = w25q_write_enable();
         w25q_cs_high();
-        if (ret != ESP_OK) return ret;
+        if (ret != ESP_OK) { driver_unlock(); return ret; }
 
         // 发送 PAGE PROGRAM 命令 + 地址 + 数据
         w25q_cs_low();
@@ -425,6 +465,7 @@ esp_err_t w25q256_write(uint32_t addr, const uint8_t *buf, size_t len)
             ret = spi_device_polling_transmit(g_spi_dev, &t_hdr);
             if (ret != ESP_OK) {
                 w25q_cs_high();
+                driver_unlock();
                 return ret;
             }
 
@@ -439,17 +480,19 @@ esp_err_t w25q256_write(uint32_t addr, const uint8_t *buf, size_t len)
         }
         w25q_cs_high();
 
-        if (ret != ESP_OK) return ret;
+        if (ret != ESP_OK) { driver_unlock(); return ret; }
 
-        // 等待写完成
-        if (!w25q256_wait_busy(100)) {
+        // 等待写完成（仍持锁——见 w25q_wait_busy_locked 注释）
+        if (!w25q_wait_busy_locked(100)) {
             ESP_LOGE(TAG, "页写入超时 @ 0x%08lX", (unsigned long)(addr + offset));
+            driver_unlock();
             return ESP_ERR_TIMEOUT;
         }
 
         offset += chunk;
     }
 
+    driver_unlock();
     return ESP_OK;
 }
 
@@ -457,12 +500,12 @@ esp_err_t w25q256_write(uint32_t addr, const uint8_t *buf, size_t len)
 
 static esp_err_t w25q_erase_op(uint8_t cmd, uint32_t addr, const char *op_name)
 {
-    if (!g_spi_dev) return ESP_FAIL;
+    if (!g_spi_dev || !driver_lock()) return ESP_FAIL;
 
     w25q_cs_low();
     esp_err_t ret = w25q_write_enable();
     w25q_cs_high();
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) { driver_unlock(); return ret; }
 
     w25q_cs_low();
     ret = w25q_send_cmd_addr(cmd, addr);
@@ -470,15 +513,19 @@ static esp_err_t w25q_erase_op(uint8_t cmd, uint32_t addr, const char *op_name)
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "%s 命令发送失败", op_name);
+        driver_unlock();
         return ret;
     }
 
     // 等待完成 — 扇区擦除通常 <400ms, 块擦除 <2s, 全片擦除最多 400s
+    // （仍持锁——擦除期间芯片忙，不能让别的入口插进来）
     uint32_t timeout = (cmd == W25Q_CMD_CHIP_ERASE_1) ? 400000 : 5000;
-    if (!w25q256_wait_busy(timeout)) {
+    if (!w25q_wait_busy_locked(timeout)) {
         ESP_LOGE(TAG, "%s 超时", op_name);
+        driver_unlock();
         return ESP_ERR_TIMEOUT;
     }
+    driver_unlock();
     return ESP_OK;
 }
 
@@ -523,15 +570,17 @@ uint64_t w25q256_get_capacity(void)
 
 esp_err_t w25q256_read_status(uint8_t *sr1, uint8_t *sr2, uint8_t *sr3)
 {
-    if (!g_spi_dev) return ESP_FAIL;
+    if (!g_spi_dev || !driver_lock()) return ESP_FAIL;
+
+    esp_err_t ret = ESP_OK;
 
     if (sr1) {
         w25q_cs_low();
-        w25q_read_sr1(sr1);
+        ret = w25q_read_sr1(sr1);
         w25q_cs_high();
     }
 
-    if (sr2) {
+    if (ret == ESP_OK && sr2) {
         uint8_t tx[2] = {W25Q_CMD_READ_SR2, 0x00};
         uint8_t rx[2] = {0};
         w25q_cs_low();
@@ -539,13 +588,12 @@ esp_err_t w25q256_read_status(uint8_t *sr1, uint8_t *sr2, uint8_t *sr3)
             .flags = 0, .length = 16, .rxlength = 16,
             .tx_buffer = tx, .rx_buffer = rx,
         };
-        esp_err_t ret = spi_device_polling_transmit(g_spi_dev, &t2);
+        ret = spi_device_polling_transmit(g_spi_dev, &t2);
         w25q_cs_high();
-        if (ret != ESP_OK) return ret;
-        *sr2 = rx[1];
+        if (ret == ESP_OK) *sr2 = rx[1];
     }
 
-    if (sr3) {
+    if (ret == ESP_OK && sr3) {
         uint8_t tx[2] = {W25Q_CMD_READ_SR3, 0x00};
         uint8_t rx[2] = {0};
         w25q_cs_low();
@@ -553,13 +601,13 @@ esp_err_t w25q256_read_status(uint8_t *sr1, uint8_t *sr2, uint8_t *sr3)
             .flags = 0, .length = 16, .rxlength = 16,
             .tx_buffer = tx, .rx_buffer = rx,
         };
-        esp_err_t ret = spi_device_polling_transmit(g_spi_dev, &t3);
+        ret = spi_device_polling_transmit(g_spi_dev, &t3);
         w25q_cs_high();
-        if (ret != ESP_OK) return ret;
-        *sr3 = rx[1];
+        if (ret == ESP_OK) *sr3 = rx[1];
     }
 
-    return ESP_OK;
+    driver_unlock();
+    return ret;
 }
 
 /* ==========================================================================

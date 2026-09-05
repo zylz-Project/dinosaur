@@ -1,3 +1,16 @@
+/*
+ * audio.h — 音频总入口（ES8311 codec，唯一拥有 I2S 设备的模块）
+ *
+ * 职责：初始化 codec/I2S；两条独立的播放路径都在这里汇合——
+ *   ① Flash Opus 路径：PlayDinoSound() 入队，dino_play 任务从 SPI Flash
+ *      流式读取 → OGG 解封装 → Opus 解码 → I2S（见 flash_audio/ogg_demuxer）；
+ *   ② LLM 对话路径：AudioReadMic48k() 采集麦克风 / AudioWritePcm48k() 直写
+ *      扬声器（被 chat.cc 的 TTS 播放使用）。
+ * 另负责：音量包络提取 GetAudioMotionData()（驱动动作跟随声音）、
+ * 各种提示音（开关机叮咚/对话提示音）。
+ * 不负责：音频文件存哪里（flash_audio.cc）、解码器细节（managed_components）。
+ * 被谁调用：main.cc、chat.cc、auto_run.cc、power.cc、http_server.cc。
+ */
 #pragma once
 
 #include <cstdint>

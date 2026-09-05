@@ -1,10 +1,10 @@
 /*
- * wifi_config.h — WiFi 配对（参考小智 esp-wifi-connect 思路）
+ * wifi_config.h — WiFi 配网（SoftAP 热点 + captive portal）
  *
  * 流程：
  *   1. 启动时从 NVS 读取已保存的 SSID/密码（没有则回退 config.h 默认值）。
  *   2. 若没有任何已保存凭据且连接失败 → 自动进入配网模式：
- *      开启 SoftAP "Panda-XXXX"，手机连上后访问 192.168.4.1（DNS 劫持跳转），
+ *      开启 SoftAP "Dino-XXXX"，手机连上后访问 192.168.4.1（DNS 劫持跳转），
  *      网页选择/输入 WiFi 并提交 → 保存到 NVS → 切回 STA 连接。
  */
 #pragma once

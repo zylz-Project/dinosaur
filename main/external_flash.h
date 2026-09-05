@@ -1,3 +1,10 @@
+/*
+ * external_flash.h — 外置 SPI Flash 编译期抽象层（NOR / NAND 二选一）
+ *
+ * 职责：根据 config.h 的 EXTERNAL_FLASH_TYPE 在编译期把 external_flash_*()
+ * 转发到 w25q256（NOR, 32MB）或 w25n01gv（NAND, 128MB）驱动。
+ * flash_audio.cc 只看本头文件，不关心底层芯片型号。
+ */
 #pragma once
 
 #include "config.h"

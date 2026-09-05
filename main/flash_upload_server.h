@@ -1,3 +1,10 @@
+/*
+ * flash_upload_server.h — Flash 音频管理页 + 上传/擦除 Web API
+ *
+ * 职责：向 http_server 注册自己的路由（/flash 管理页、/api/flash/ 系列），
+ * 网页上传 .opus → flash_audio_write_file 写入外置 Flash，可删除/全擦。
+ * 播放进行中拒绝写操作（避免读到一半的数据被改）。
+ */
 #pragma once
 
 #include "esp_err.h"

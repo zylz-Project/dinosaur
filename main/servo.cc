@@ -1,3 +1,6 @@
+/*
+ * servo.cc — 舵机 PWM 实现（见 servo.h 职责说明）
+ */
 #include "servo.h"
 #include "config.h"
 

@@ -1,3 +1,10 @@
+/*
+ * ogg_demuxer.h — OGG 容器解封装状态机（为 Opus 流式解码供包）
+ *
+ * 职责：把 SPI Flash 里流式读出的 OGG 字节流解析成一页页 Opus 包
+ * （自动跳过 OpusHead/OpusTags，支持跨页 continuation），零堆分配、
+ * 8KB 固定包缓冲。audio.cc 的 Flash 播放路径用它喂 esp_audio_codec。
+ */
 #ifndef OGG_DEMUXER_H_
 #define OGG_DEMUXER_H_
 

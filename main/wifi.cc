@@ -1,3 +1,6 @@
+/*
+ * wifi.cc — WiFi STA 连接与事件处理（见 wifi.h 职责说明）
+ */
 #include "wifi.h"
 #include "config.h"
 #include "wifi_config.h"
@@ -76,7 +79,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base,
         if (!WifiConfigPortalRunning()) esp_wifi_connect();
 
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_START) {
-        ESP_LOGI(TAG, "Config SoftAP is active; connect to Panda-XXXX at 192.168.4.1");
+        ESP_LOGI(TAG, "Config SoftAP is active; connect to Dino-XXXX at 192.168.4.1");
 
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
         auto *evt = (wifi_event_ap_staconnected_t *)data;

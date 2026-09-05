@@ -3,7 +3,7 @@
  *
  * 配网网页由 main 的 http_server 提供（/api/wifi/ 系列端点），本文件只负责：
  *   - NVS 凭据读写
- *   - SoftAP "Panda-XXXX" 启停
+ *   - SoftAP "Dino-XXXX" 启停
  *   - DNS 劫持（把任意域名解析到 192.168.4.1，手机连上 AP 自动跳转配网页）
  *   - 保存凭据后切回 STA 连接
  */

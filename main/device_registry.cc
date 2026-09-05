@@ -1,3 +1,6 @@
+/*
+ * device_registry.cc — Audio Hub 设备注册/激活/心跳实现（见 device_registry.h）
+ */
 #include "device_registry.h"
 #include "config.h"
 
