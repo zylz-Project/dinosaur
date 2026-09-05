@@ -1,0 +1,33 @@
+<html lang="zh">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>音频验证</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:monospace;background:#1a1a2e;color:#eee;padding:12px;max-width:600px;margin:auto}
+h1{text-align:center;font-size:18px;color:#e94560;margin:8px 0}
+.card{background:#16213e;border-radius:8px;padding:12px;margin-bottom:10px}
+h2{font-size:14px;margin-bottom:6px;color:#4ecca3}
+.file{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid #333;flex-wrap:wrap}
+.fname{flex:1;font-size:12px;min-width:120px}
+.fsize{font-size:10px;color:#888;min-width:60px}
+audio{width:200px;height:32px}
+.status{padding:6px;text-align:center;font-size:12px;color:#888}
+</style>
+</head>
+<body>
+<h1>音频验证</h1>
+<div class="card">
+<h2>SPI Flash 中的文件</h2>
+<div id="files">加载中...</div>
+</div>
+<div class="status" id="info"></div>
+<script>
+async function loadFiles(){
+ let r=await fetch('/api/flash/status'),d=await r.json(),h='';
+ d.files.forEach((f,i)=>{h+='<div class="file"><span class="fname">'+f.name+'</span><span class="fsize">'+(f.size/1024).toFixed(1)+' KB</span><audio controls preload="none"><source src="/play?idx='+i+'" type="audio/ogg"></audio></div>'});
+ document.getElementById('files').innerHTML=h||'<p style="color:#888;text-align:center">没有文件</p>';
+}
+loadFiles();
+</script>
+</body>
+</html>

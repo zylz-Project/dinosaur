@@ -18,143 +18,11 @@
 static const char *TAG = "flash_upload";
 
 // === Flash management web page ===
-static const char kFlashHtml[] = R"raw(
-<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Flash Audio Manager</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:monospace;background:#1a1a2e;color:#eee;padding:12px;max-width:600px;margin:auto}
-h1{text-align:center;font-size:18px;color:#e94560;margin:8px 0}
-.card{background:#16213e;border-radius:8px;padding:12px;margin-bottom:10px}
-h2{font-size:14px;margin-bottom:6px;color:#4ecca3}
-.btn{padding:8px 16px;border:none;border-radius:4px;font-size:13px;cursor:pointer;color:#fff;margin:4px}
-.btn-upload{background:#4ecca3;color:#000}
-.btn-erase{background:#e94560}
-.btn-refresh{background:#333}
-table{width:100%;border-collapse:collapse;font-size:11px}
-th,td{padding:4px 6px;text-align:left;border-bottom:1px solid #333}
-th{color:#4ecca3}
-.status{padding:6px;text-align:center;font-size:12px;color:#888}
-input[type=file]{margin:6px 0;color:#eee}
-.progress{width:100%;height:6px;background:#333;border-radius:3px;margin:4px 0;display:none}
-.progress div{height:100%;background:#4ecca3;border-radius:3px;width:0%}
-</style>
-</head>
-<body>
-<h1>Flash Audio Manager</h1>
-<div class="status" id="status">Ready</div>
-
-<div class="card">
-<h2>Upload .opus file</h2>
-<input type="file" id="fileInput" accept=".opus">
-<button class="btn btn-upload" onclick="uploadFile()">Upload to Flash</button>
-<div class="progress" id="progress"><div id="progressBar"></div></div>
-</div>
-
-<div class="card">
-<h2>Files on Flash <button class="btn btn-refresh" onclick="refreshStatus()">Refresh</button></h2>
-<div id="fileList">Loading...</div>
-</div>
-
-<div class="card">
-<h2>Danger Zone</h2>
-<button class="btn btn-erase" onclick="eraseAll()">Erase All Audio</button>
-</div>
-
-<script>
-async function api(url, body) {
-    try{
-        let o = body ? {method:'POST', body:body} : {method:'GET'};
-        let r = await fetch(url, o);
-        return await r.text();
-    }catch(e){ return null; }
-}
-
-async function refreshStatus() {
-    let txt = await api('/api/flash/status');
-    if(!txt){ document.getElementById('fileList').innerHTML='<p style="color:#e94560">Connection failed</p>'; return; }
-    try{
-        let j = JSON.parse(txt);
-        if(j.count==0){
-            document.getElementById('fileList').innerHTML='<p style="color:#888">No files on flash</p>';
-        } else {
-            let html='<table><tr><th>#</th><th>Filename</th><th>Size</th><th>Rate</th></tr>';
-            j.files.forEach((f,i)=>{
-                let kb = (f.size/1024).toFixed(1);
-                html+='<tr><td>'+i+'</td><td>'+f.name+'</td><td>'+kb+' KB</td><td>'+f.sample_rate+' Hz</td></tr>';
-            });
-            html+='</table>';
-            html+='<p style="margin-top:6px;color:#888">Total: '+j.count+' files, '+(j.total_size/1024).toFixed(1)+' KB / 32 MB</p>';
-            document.getElementById('fileList').innerHTML=html;
-        }
-    }catch(e){
-        document.getElementById('fileList').innerHTML='<p style="color:#e94560">Parse error</p>';
-    }
-}
-
-async function uploadFile() {
-    let f = document.getElementById('fileInput').files[0];
-    if(!f){ setStatus('Select a file first','#e94560'); return; }
-    if(!f.name.endsWith('.opus')){ setStatus('Only .opus files allowed','#e94560'); return; }
-
-    setStatus('Uploading: '+f.name+'...','#4ecca3');
-    document.getElementById('progress').style.display='block';
-
-    let form = new FormData();
-    form.append('file', f);
-
-    let xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/flash/upload');
-    xhr.upload.onprogress = function(e) {
-        if(e.lengthComputable){
-            let pct = (e.loaded/e.total*100).toFixed(0);
-            document.getElementById('progressBar').style.width = pct+'%';
-        }
-    };
-    xhr.onload = function() {
-        document.getElementById('progress').style.display='none';
-        document.getElementById('progressBar').style.width='0%';
-        if(xhr.status==200){
-            setStatus('Uploaded: '+f.name+' ✓','#4ecca3');
-            refreshStatus();
-        } else {
-            setStatus('Upload failed: '+xhr.responseText,'#e94560');
-        }
-    };
-    xhr.onerror = function() {
-        document.getElementById('progress').style.display='none';
-        setStatus('Network error','#e94560');
-    };
-    xhr.send(form);
-}
-
-async function eraseAll() {
-    if(!confirm('Erase ALL audio files from flash? This cannot be undone.')) return;
-    setStatus('Erasing...','#e94560');
-    let txt = await api('/api/flash/erase');
-    if(txt && txt.startsWith('OK')){
-        setStatus('All files erased ✓','#4ecca3');
-        refreshStatus();
-    } else {
-        setStatus('Erase failed','#e94560');
-    }
-}
-
-function setStatus(msg, color) {
-    let s = document.getElementById('status');
-    s.textContent = msg;
-    s.style.color = color;
-}
-
-refreshStatus();
-</script>
-</body>
-</html>
-)raw";
+// 管理页/播放页 HTML 在 web_assets/flash.html、audio.html，EMBED_FILES 链入。
+extern const unsigned char flash_html_start[] asm("_binary_flash_html_start");
+extern const unsigned char flash_html_end[]   asm("_binary_flash_html_end");
+#define kFlashHtml ((const char *)flash_html_start)
+#define kFlashHtmlLen ((size_t)(flash_html_end - flash_html_start))
 
 /* ==========================================================================
    HTTP Handlers
@@ -162,7 +30,7 @@ refreshStatus();
 
 static esp_err_t HandleFlashPage(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_send(req, kFlashHtml, strlen(kFlashHtml));
+    httpd_resp_send(req, kFlashHtml, kFlashHtmlLen);
     return ESP_OK;
 }
 
@@ -359,42 +227,10 @@ static esp_err_t HandleFlashErase(httpd_req_t *req) {
    GET /play?idx=0   →  raw .opus file #0 (streamed to browser audio element)
    ========================================================================== */
 
-static const char kAudioHtml[] = R"raw(
-<!DOCTYPE html>
-<html lang="zh">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>音频验证</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:monospace;background:#1a1a2e;color:#eee;padding:12px;max-width:600px;margin:auto}
-h1{text-align:center;font-size:18px;color:#e94560;margin:8px 0}
-.card{background:#16213e;border-radius:8px;padding:12px;margin-bottom:10px}
-h2{font-size:14px;margin-bottom:6px;color:#4ecca3}
-.file{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid #333;flex-wrap:wrap}
-.fname{flex:1;font-size:12px;min-width:120px}
-.fsize{font-size:10px;color:#888;min-width:60px}
-audio{width:200px;height:32px}
-.status{padding:6px;text-align:center;font-size:12px;color:#888}
-</style>
-</head>
-<body>
-<h1>音频验证</h1>
-<div class="card">
-<h2>SPI Flash 中的文件</h2>
-<div id="files">加载中...</div>
-</div>
-<div class="status" id="info"></div>
-<script>
-async function loadFiles(){
- let r=await fetch('/api/flash/status'),d=await r.json(),h='';
- d.files.forEach((f,i)=>{h+='<div class="file"><span class="fname">'+f.name+'</span><span class="fsize">'+(f.size/1024).toFixed(1)+' KB</span><audio controls preload="none"><source src="/play?idx='+i+'" type="audio/ogg"></audio></div>'});
- document.getElementById('files').innerHTML=h||'<p style="color:#888;text-align:center">没有文件</p>';
-}
-loadFiles();
-</script>
-</body>
-</html>
-)raw";
+extern const unsigned char audio_html_start[] asm("_binary_audio_html_start");
+extern const unsigned char audio_html_end[]   asm("_binary_audio_html_end");
+#define kAudioHtml ((const char *)audio_html_start)
+#define kAudioHtmlLen ((size_t)(audio_html_end - audio_html_start))
 
 /* Handle /play → HTML, /play?idx=N → raw opus stream */
 static esp_err_t HandlePlay(httpd_req_t *req) {
@@ -433,7 +269,7 @@ static esp_err_t HandlePlay(httpd_req_t *req) {
 
     // /play → HTML page
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_send(req, kAudioHtml, strlen(kAudioHtml));
+    httpd_resp_send(req, kAudioHtml, kAudioHtmlLen);
     return ESP_OK;
 }
 
