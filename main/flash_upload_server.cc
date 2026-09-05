@@ -4,6 +4,7 @@
 #include "flash_upload_server.h"
 #include "flash_audio.h"
 #include "audio.h"
+#include "http_server.h"
 
 #include <esp_http_server.h>
 #include <esp_log.h>
@@ -15,9 +16,6 @@
 #include <esp_heap_caps.h>
 
 static const char *TAG = "flash_upload";
-
-// External reference to the HTTP server handle (from http_server.cc)
-extern httpd_handle_t g_http_server;
 
 // === Flash management web page ===
 static const char kFlashHtml[] = R"raw(
@@ -440,7 +438,8 @@ static esp_err_t HandlePlay(httpd_req_t *req) {
 }
 
 void flash_upload_server_register(void) {
-    if (!g_http_server) {
+    httpd_handle_t server = HttpServerHandle();
+    if (!server) {
         ESP_LOGW(TAG, "HTTP server not started, flash upload endpoints skipped");
         return;
     }
@@ -453,7 +452,7 @@ void flash_upload_server_register(void) {
         {"/api/flash/erase",  HTTP_POST, HandleFlashErase,  nullptr},
     };
     for (auto &u : uris) {
-        httpd_register_uri_handler(g_http_server, &u);
+        httpd_register_uri_handler(server, &u);
     }
 
     ESP_LOGI(TAG, "Flash endpoints: /, /flash, /play, /api/flash/*");

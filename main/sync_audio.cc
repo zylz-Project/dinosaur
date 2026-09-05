@@ -7,6 +7,7 @@
 #include "flash_audio.h"
 #include "audio.h"
 #include "config.h"
+#include "wifi.h"
 
 #include <cJSON.h>
 #include <esp_http_client.h>
@@ -346,6 +347,10 @@ esp_err_t sync_audio_files(const char *api_token)
     }
     build_base_url();
 
+    /* 省电策略跟着下载走：大文件下载期间禁 modem sleep（DTIM 批量收包
+     * 会让吞吐减半），下载完恢复。调用方（main.cc）不用再操心这件事。 */
+    WiFiPowerSave(false);
+
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  Sync Server: %s", g_base_url);
     ESP_LOGI(TAG, "  Product ID:  %s", SYNC_PRODUCT_ID);
@@ -445,7 +450,7 @@ esp_err_t sync_audio_files(const char *api_token)
     }
     ESP_LOGI(TAG, "--- Result: +%d -%d =%d ---", to_dl, deleted, to_skip);
     if (to_dl == 0 && deleted == 0) {
-        ESP_LOGI(TAG, "All up to date, nothing to do");
+        WiFiPowerSave(true);
         return (!force_refresh || save_synced_revision(server_revision))
             ? ESP_OK : ESP_FAIL;
     }
@@ -544,6 +549,7 @@ esp_err_t sync_audio_files(const char *api_token)
 
     ESP_LOGI(TAG, "--- Sync end: download=%d delete=%d skip=%d fail=%d ---",
              downloaded, deleted, skipped, failed);
+    WiFiPowerSave(true);  // 下载结束，恢复省电
     if (failed == 0 && force_refresh &&
         !save_synced_revision(server_revision)) {
         return ESP_FAIL;

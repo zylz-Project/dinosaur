@@ -22,6 +22,7 @@ extern "C" void app_main()
 {
     nvs_flash_init();
     InitPower();
+    PowerSetButtonCallback(ChatToggle);  // 双击电源键 → 切换 AI 对话
     InitAudio();
     InitServos();
     PlayBootTone();  // immediate "power on" chime, before the slower WiFi/sync path
@@ -66,9 +67,7 @@ extern "C" void app_main()
             }
             char api_token[DEVICE_API_TOKEN_SIZE] = {};
             if (device_registry_get_api_token(api_token, sizeof(api_token))) {
-                WiFiPowerSave(false);           // disable PS during download
-                sync_audio_files(api_token);
-                WiFiPowerSave(true);            // re-enable PS for battery life
+                sync_audio_files(api_token);   // 省电开关由 sync_audio 内部管理
             } else {
                 ESP_LOGE(TAG, "无法读取已验证的设备令牌，跳过同步");
             }

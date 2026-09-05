@@ -11,8 +11,6 @@
 
 #include <esp_http_server.h>
 
-extern httpd_handle_t g_http_server;
-
 void StartHttpServer();
 
 /** 供 flash_upload_server 等模块拿句柄注册自己的路由（NULL=还没启动）。 */

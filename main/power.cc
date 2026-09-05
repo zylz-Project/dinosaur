@@ -5,7 +5,6 @@
 #include "config.h"
 #include "servo.h"
 #include "audio.h"
-#include "chat.h"
 
 #include <driver/gpio.h>
 #include <esp_adc/adc_cali.h>
@@ -50,6 +49,8 @@ static uint32_t s_btn_press_start = 0;  // ms
 static int s_btn_hold_tip = 0;          // last progress hint (500ms steps)
 static uint32_t s_last_click_ms = 0;    // ms of last short press release
 static int s_click_count = 0;           // consecutive short presses
+/* 双击回调（main.cc 接线到 ChatToggle）——power 模块不认识 chat，只发通知 */
+static void (*s_button_cb_)(void) = nullptr;
 // Long-press shutdown is inert until the button has been released once after
 // boot — at power-on the button is necessarily held, and we must not fire then.
 static bool s_btn_armed = false;
@@ -204,7 +205,7 @@ void InitPower()
               if (s_click_count >= 2) {
                 s_click_count = 0;
                 ESP_LOGI(TAG, "DOUBLE CLICK -> toggle chat");
-                ChatToggle();
+                if (s_button_cb_) s_button_cb_();  // 回调由 main.cc 接线（如 ChatToggle）
               }
             }
             s_btn_state = BTN_IDLE;
@@ -245,6 +246,8 @@ void InitPower()
   ESP_LOGI(TAG, "Power monitor started (long press %dms, debounce %dms)",
            POWER_LONG_PRESS_MS, POWER_DEBOUNCE_MS);
 }
+
+void PowerSetButtonCallback(void (*cb)(void)) { s_button_cb_ = cb; }
 
 int GetBatteryLevel() { return battery_level_; }
 

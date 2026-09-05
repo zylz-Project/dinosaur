@@ -32,6 +32,8 @@ static const char *TAG = "dino_http";
 
 httpd_handle_t g_http_server = nullptr;
 
+httpd_handle_t HttpServerHandle(void) { return g_http_server; }
+
 // ======================== Embedded Web UI ========================
 static const char kHtml[] = R"raw(
 <!DOCTYPE html>

@@ -673,7 +673,10 @@ void ChatInit(void)
         g_ws_frame_buf = (int16_t *)heap_caps_malloc(WS_FRAME_SAMPLES * sizeof(int16_t), MALLOC_CAP_INTERNAL);
         if (!g_ws_frame_buf) { ESP_LOGE(TAG, "WS frame buf alloc fail"); return; }
     }
-    if (realtime_ws_init(CHAT_WS_URL) != 0) {
+    /* TLS 需要系统时间——把 WiFi 的时间同步等待注入给协议栈，
+     * realtime_ws 自身不依赖 wifi 模块。 */
+    const realtime_ws_hooks_t hooks = {.time_sync_wait = WiFiWaitForTimeSync};
+    if (realtime_ws_init(CHAT_WS_URL, &hooks) != 0) {
         ESP_LOGE(TAG, "realtime_ws_init fail");
         return;
     }

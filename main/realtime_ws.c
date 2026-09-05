@@ -11,7 +11,6 @@
 #include "display.h"
 #include "ws_auth.h"
 #include "chat_cert.h"
-#include "wifi.h"
 #include <string.h>
 #include <stdlib.h>
 #include "esp_log.h"
@@ -32,6 +31,8 @@ static const char *TAG = "REALTIME_WS";
  * =================================================================== */
 static esp_websocket_client_handle_t ws_client = NULL;
 static char *ws_url = NULL;
+/* 连接前门控（time_sync 等待），由 chat.cc 通过 realtime_ws_init 传入。 */
+static bool (*g_time_sync_wait)(int timeout_ms) = NULL;
 static volatile bool ws_connected = false;
 static volatile bool g_ready = false;
 static volatile TickType_t g_last_rx_tick = 0;  /* 最后收到数据的时间 */
@@ -1082,8 +1083,9 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t event_id,
 /* ===================================================================
  *  Connection management
  * =================================================================== */
-int realtime_ws_init(const char *url) {
+int realtime_ws_init(const char *url, const realtime_ws_hooks_t *hooks) {
     if (!url) return -1;
+    g_time_sync_wait = hooks ? hooks->time_sync_wait : NULL;
     g_resp_mutex = xSemaphoreCreateMutex();
     g_conn_mutex = xSemaphoreCreateMutex();
     g_ws_tx_mutex = xSemaphoreCreateMutex();
@@ -1122,7 +1124,9 @@ int realtime_ws_init(const char *url) {
 /* 鉴权+连接独立任务: esp_http_client 的 TLS+JSON 吃栈, 不能在 main 任务里跑 */
 static void ws_connect_task(void *arg)
 {
-    if (!WiFiWaitForTimeSync(10000)) {
+    /* TLS 证书校验依赖系统时间。time_sync_wait 由调用方注入
+     * （chat.cc 传 WiFiWaitForTimeSync）；NULL = 跳过等待直接连。 */
+    if (g_time_sync_wait && !g_time_sync_wait(10000)) {
         ESP_LOGW(TAG, "TLS connect deferred until system time is synchronized");
         goto done;
     }

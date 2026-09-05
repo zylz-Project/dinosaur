@@ -58,7 +58,16 @@ bool realtime_ws_get_emotion(realtime_ws_emotion_t *out);
 /* ===================================================================
  *  连接管理 (Connection)
  * =================================================================== */
-int  realtime_ws_init(const char *url);
+
+/* 连接前的可选门控。realtime_ws 不认识 WiFi：由调用方（chat.cc）在
+ * init 时把"等系统时间同步"的函数指针传进来；NULL = 跳过等待直接连。 */
+typedef struct {
+    /** 等待系统时间同步（TLS 校验依赖）；返回 false 表示超时未同步。
+     *  可为 NULL —— NULL 时连接任务直接跳过此等待。 */
+    bool (*time_sync_wait)(int timeout_ms);
+} realtime_ws_hooks_t;
+
+int  realtime_ws_init(const char *url, const realtime_ws_hooks_t *hooks);
 void realtime_ws_connect(void);
 void realtime_ws_disconnect(void);
 bool realtime_ws_is_connected(void);
