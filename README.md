@@ -8,6 +8,7 @@ Flash Opus 音效、LLM 实时语音对话（ASR→LLM→TTS）、Web 控制面�
 
 深入文档：
 - 动作系统 V3.3 波形设计与实机舵机映射：[docs/elegant_motion_v2.md](docs/elegant_motion_v2.md)
+- 动作库结构、增改动作方法与完整执行流程：[docs/action_library_and_workflow.md](docs/action_library_and_workflow.md)
 - 全部 29 个互动动作 + 5 个环境音场景目录：[docs/dinosaur_action_catalog_v2_8.md](docs/dinosaur_action_catalog_v2_8.md)
 - 音效与动作的配对规则：[docs/audio_and_action.md](docs/audio_and_action.md)
 
